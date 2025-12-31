@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use percolator_prog::engine::{RiskEngine, RiskParams, AccountKind};
+    use percolator::{RiskEngine, RiskParams, AccountKind};
     use solana_program::pubkey::Pubkey;
 
     fn default_params() -> RiskParams {

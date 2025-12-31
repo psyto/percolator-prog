@@ -1,7 +1,7 @@
 #[cfg(kani)]
 mod verification {
     use super::*;
-    use percolator_prog::engine::{RiskEngine, RiskParams};
+    use percolator::{RiskEngine, RiskParams};
 
     #[kani::proof]
     fn verify_engine_init() {

@@ -1,6 +1,6 @@
 use rand::{Rng, SeedableRng};
 use rand_xorshift::XorShiftRng;
-use percolator_prog::engine::{RiskEngine, RiskParams, NoOpMatcher};
+use percolator::{RiskEngine, RiskParams, NoOpMatcher};
 
 fn default_params() -> RiskParams {
     RiskParams {
