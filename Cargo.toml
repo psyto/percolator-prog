@@ -10,6 +10,7 @@ name = "percolator_prog"
 path = "src/percolator.rs"
 
 [features]
+default = ["unit-test"]
 unit-test = []
 no-entrypoint = []
 test-sbf = []
