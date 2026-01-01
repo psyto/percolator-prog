@@ -2780,6 +2780,7 @@ name = "percolator-prog"
 version = "0.1.0"
 dependencies = [
  "arrayref",
+ "bincode",
  "bytemuck",
  "num-derive 0.4.2",
  "num-traits",

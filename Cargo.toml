@@ -10,6 +10,7 @@ name = "percolator_prog"
 path = "src/percolator.rs"
 
 [features]
+unit-test = []
 no-entrypoint = []
 test-sbf = []
 fuzz = []
@@ -27,6 +28,7 @@ num-traits = "0.2"
 percolator = { path = "../percolator" }
 
 [dev-dependencies]
+bincode = "1"
 solana-program-test = "1.18"
 solana-sdk = "1.18"
 rand = "0.8"

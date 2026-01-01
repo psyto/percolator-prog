@@ -465,6 +465,11 @@ pub mod collateral {
         program::{invoke, invoke_signed},
     };
 
+    #[cfg(feature = "unit-test")]
+    use solana_program::program_pack::Pack;
+    #[cfg(feature = "unit-test")]
+    use spl_token::state::Account as TokenAccount;
+
     pub fn deposit<'a>(
         token_program: &AccountInfo<'a>,
         source: &AccountInfo<'a>,
@@ -472,15 +477,31 @@ pub mod collateral {
         authority: &AccountInfo<'a>,
         amount: u64
     ) -> Result<(), ProgramError> {
-        let ix = spl_token::instruction::transfer(
-            token_program.key,
-            source.key,
-            dest.key,
-            authority.key,
-            &[],
-            amount,
-        )?;
-        invoke(&ix, &[source.clone(), dest.clone(), authority.clone(), token_program.clone()])
+        #[cfg(not(feature = "unit-test"))]
+        {
+            let ix = spl_token::instruction::transfer(
+                token_program.key,
+                source.key,
+                dest.key,
+                authority.key,
+                &[],
+                amount,
+            )?;
+            invoke(&ix, &[source.clone(), dest.clone(), authority.clone(), token_program.clone()])
+        }
+        #[cfg(feature = "unit-test")]
+        {
+            let mut src_data = source.try_borrow_mut_data()?;
+            let mut src_state = TokenAccount::unpack(&src_data)?;
+            src_state.amount = src_state.amount.checked_sub(amount).ok_or(ProgramError::InsufficientFunds)?;
+            TokenAccount::pack(src_state, &mut src_data)?;
+
+            let mut dst_data = dest.try_borrow_mut_data()?;
+            let mut dst_state = TokenAccount::unpack(&dst_data)?;
+            dst_state.amount = dst_state.amount.checked_add(amount).ok_or(ProgramError::InvalidAccountData)?;
+            TokenAccount::pack(dst_state, &mut dst_data)?;
+            Ok(())
+        }
     }
 
     pub fn withdraw<'a>(
@@ -491,15 +512,31 @@ pub mod collateral {
         amount: u64,
         signer_seeds: &[&[&[u8]]],
     ) -> Result<(), ProgramError> {
-        let ix = spl_token::instruction::transfer(
-            token_program.key,
-            source.key,
-            dest.key,
-            authority.key,
-            &[],
-            amount,
-        )?;
-        invoke_signed(&ix, &[source.clone(), dest.clone(), authority.clone(), token_program.clone()], signer_seeds)
+        #[cfg(not(feature = "unit-test"))]
+        {
+            let ix = spl_token::instruction::transfer(
+                token_program.key,
+                source.key,
+                dest.key,
+                authority.key,
+                &[],
+                amount,
+            )?;
+            invoke_signed(&ix, &[source.clone(), dest.clone(), authority.clone(), token_program.clone()], signer_seeds)
+        }
+        #[cfg(feature = "unit-test")]
+        {
+            let mut src_data = source.try_borrow_mut_data()?;
+            let mut src_state = TokenAccount::unpack(&src_data)?;
+            src_state.amount = src_state.amount.checked_sub(amount).ok_or(ProgramError::InsufficientFunds)?;
+            TokenAccount::pack(src_state, &mut src_data)?;
+
+            let mut dst_data = dest.try_borrow_mut_data()?;
+            let mut dst_state = TokenAccount::unpack(&dst_data)?;
+            dst_state.amount = dst_state.amount.checked_add(amount).ok_or(ProgramError::InvalidAccountData)?;
+            TokenAccount::pack(dst_state, &mut dst_data)?;
+            Ok(())
+        }
     }
 }
 
@@ -667,7 +704,6 @@ pub mod processor {
                 require_initialized(&data)?;
                 let config = state::read_config(&data);
 
-                // Verify vault
                 let (auth, _) = accounts::derive_vault_authority(program_id, a_slab.key);
                 verify_vault(a_vault, &auth, &Pubkey::new_from_array(config.collateral_mint), &Pubkey::new_from_array(config.vault_pubkey))?;
 
@@ -763,6 +799,8 @@ pub mod processor {
                 if Pubkey::new_from_array(owner) != *a_user.key {
                     return Err(PercolatorError::EngineUnauthorized.into());
                 }
+
+                // Verify oracle pubkey matches config
 
                 // Verify oracle pubkey matches config
                 accounts::expect_key(a_oracle_idx, &Pubkey::new_from_array(config.index_oracle))?;
