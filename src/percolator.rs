@@ -1,7 +1,11 @@
+//! Percolator: Single-file Solana program with embedded Risk Engine.
+
 #![no_std]
 #![deny(unsafe_code)]
 
-//! Percolator: Single-file Solana program with embedded Risk Engine.
+extern crate alloc;
+
+use solana_program::pubkey::Pubkey;
 
 // 1. mod constants
 pub mod constants {
@@ -397,10 +401,6 @@ pub mod state {
         let dst = &mut data[HEADER_LEN..HEADER_LEN + CONFIG_LEN];
         dst.copy_from_slice(src);
     }
-    
-    pub fn engine_region_mut(data: &mut [u8]) -> &mut [u8] {
-        &mut data[ENGINE_OFF..ENGINE_OFF + ENGINE_LEN]
-    }
 }
 
 // 7. mod oracle
@@ -428,7 +428,6 @@ pub mod oracle {
             return Err(PercolatorError::OracleStale.into());
         }
 
-        // Check confidence: conf * 10000 <= price * conf_bps
         let price_u = price as u128;
         let lhs = (conf as u128) * 10_000;
         let rhs = price_u * (conf_bps as u128);
@@ -436,8 +435,6 @@ pub mod oracle {
             return Err(PercolatorError::OracleConfTooWide.into());
         }
 
-        // Convert to E6
-        // price_e6 = price * 10^(expo + 6)
         let scale = expo + 6;
         let final_price_u128 = if scale >= 0 {
             let mul = 10u128.pow(scale as u32);
@@ -464,34 +461,34 @@ pub mod collateral {
         account_info::AccountInfo, program_error::ProgramError,
     };
 
-    #[cfg(not(feature = "unit-test"))]
+    #[cfg(not(test))]
     use solana_program::program::{invoke, invoke_signed};
 
-    #[cfg(feature = "unit-test")]
+    #[cfg(test)]
     use solana_program::program_pack::Pack;
-    #[cfg(feature = "unit-test")]
+    #[cfg(test)]
     use spl_token::state::Account as TokenAccount;
 
     pub fn deposit<'a>(
-        token_program: &AccountInfo<'a>,
+        _token_program: &AccountInfo<'a>,
         source: &AccountInfo<'a>,
         dest: &AccountInfo<'a>,
-        authority: &AccountInfo<'a>,
+        _authority: &AccountInfo<'a>,
         amount: u64
     ) -> Result<(), ProgramError> {
-        #[cfg(not(feature = "unit-test"))]
+        #[cfg(not(test))]
         {
             let ix = spl_token::instruction::transfer(
-                token_program.key,
+                _token_program.key,
                 source.key,
                 dest.key,
-                authority.key,
+                _authority.key,
                 &[],
                 amount,
             )?;
-            invoke(&ix, &[source.clone(), dest.clone(), authority.clone(), token_program.clone()])
+            invoke(&ix, &[source.clone(), dest.clone(), _authority.clone(), _token_program.clone()])
         }
-        #[cfg(feature = "unit-test")]
+        #[cfg(test)]
         {
             let mut src_data = source.try_borrow_mut_data()?;
             let mut src_state = TokenAccount::unpack(&src_data)?;
@@ -507,26 +504,26 @@ pub mod collateral {
     }
 
     pub fn withdraw<'a>(
-        token_program: &AccountInfo<'a>,
+        _token_program: &AccountInfo<'a>,
         source: &AccountInfo<'a>,
         dest: &AccountInfo<'a>,
-        authority: &AccountInfo<'a>,
+        _authority: &AccountInfo<'a>,
         amount: u64,
-        signer_seeds: &[&[&[u8]]],
+        _signer_seeds: &[&[&[u8]]],
     ) -> Result<(), ProgramError> {
-        #[cfg(not(feature = "unit-test"))]
+        #[cfg(not(test))]
         {
             let ix = spl_token::instruction::transfer(
-                token_program.key,
+                _token_program.key,
                 source.key,
                 dest.key,
-                authority.key,
+                _authority.key,
                 &[],
                 amount,
             )?;
-            invoke_signed(&ix, &[source.clone(), dest.clone(), authority.clone(), token_program.clone()], signer_seeds)
+            invoke_signed(&ix, &[source.clone(), dest.clone(), _authority.clone(), _token_program.clone()], _signer_seeds)
         }
-        #[cfg(feature = "unit-test")]
+        #[cfg(test)]
         {
             let mut src_data = source.try_borrow_mut_data()?;
             let mut src_state = TokenAccount::unpack(&src_data)?;
@@ -976,4 +973,470 @@ pub mod entrypoint {
 // 11. mod risk (glue)
 pub mod risk {
     pub use percolator::{RiskEngine, RiskParams, RiskError, NoOpMatcher, MatchingEngine, TradeExecution};
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate alloc;
+    use alloc::{vec, vec::Vec};
+    use super::*;
+    use solana_program::{
+        account_info::AccountInfo,
+        pubkey::Pubkey,
+        clock::Clock,
+        program_pack::Pack,
+    };
+    use spl_token::state::{Account as TokenAccount, AccountState};
+    use crate::{
+        processor::process_instruction,
+        constants::{MAGIC, VERSION},
+        zc,
+        error::PercolatorError,
+        state,
+    };
+    use percolator::MAX_ACCOUNTS;
+
+    // --- Harness ---
+
+    struct TestAccount {
+        key: Pubkey,
+        owner: Pubkey,
+        lamports: u64,
+        data: Vec<u8>,
+        is_signer: bool,
+        is_writable: bool,
+    }
+
+    impl TestAccount {
+        fn new(key: Pubkey, owner: Pubkey, lamports: u64, data: Vec<u8>) -> Self {
+            Self { key, owner, lamports, data, is_signer: false, is_writable: false }
+        }
+        fn signer(mut self) -> Self { self.is_signer = true; self }
+        fn writable(mut self) -> Self { self.is_writable = true; self }
+        
+        fn to_info<'a>(&'a mut self) -> AccountInfo<'a> {
+            AccountInfo::new(
+                &self.key,
+                self.is_signer,
+                self.is_writable,
+                &mut self.lamports,
+                &mut self.data,
+                &self.owner,
+                false,
+                0,
+            )
+        }
+    }
+
+    // --- Builders ---
+
+    fn make_token_account(mint: Pubkey, owner: Pubkey, amount: u64) -> Vec<u8> {
+        let mut data = vec![0u8; TokenAccount::LEN];
+        let mut account = TokenAccount::default();
+        account.mint = mint;
+        account.owner = owner;
+        account.amount = amount;
+        account.state = AccountState::Initialized;
+        TokenAccount::pack(account, &mut data).unwrap();
+        data
+    }
+
+    fn make_pyth(price: i64, expo: i32, conf: u64, pub_slot: u64) -> Vec<u8> {
+        let mut data = vec![0u8; 208];
+        data[20..24].copy_from_slice(&expo.to_le_bytes());
+        data[176..184].copy_from_slice(&price.to_le_bytes());
+        data[184..192].copy_from_slice(&conf.to_le_bytes());
+        data[200..208].copy_from_slice(&pub_slot.to_le_bytes());
+        data
+    }
+
+    fn make_clock(slot: u64) -> Vec<u8> {
+        let clock = Clock { slot, ..Clock::default() };
+        bincode::serialize(&clock).unwrap()
+    }
+
+    struct MarketFixture {
+        program_id: Pubkey,
+        admin: TestAccount,
+        slab: TestAccount,
+        mint: TestAccount,
+        vault: TestAccount,
+        token_prog: TestAccount,
+        pyth_index: TestAccount,
+        pyth_col: TestAccount,
+        clock: TestAccount,
+        rent: TestAccount,
+        system: TestAccount,
+        vault_pda: Pubkey,
+    }
+
+    fn setup_market() -> MarketFixture {
+        let program_id = Pubkey::new_unique();
+        let slab_key = Pubkey::new_unique();
+        let (vault_pda, _) = Pubkey::find_program_address(&[b"vault", slab_key.as_ref()], &program_id);
+        let mint_key = Pubkey::new_unique();
+
+        let pyth_data = make_pyth(1000, -6, 1, 100); 
+
+        MarketFixture {
+            program_id,
+            admin: TestAccount::new(Pubkey::new_unique(), solana_program::system_program::id(), 0, vec![]).signer(),
+            slab: TestAccount::new(slab_key, program_id, 0, vec![0u8; crate::constants::SLAB_LEN]).writable(),
+            mint: TestAccount::new(mint_key, solana_program::system_program::id(), 0, vec![]),
+            vault: TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0, make_token_account(mint_key, vault_pda, 0)).writable(),
+            token_prog: TestAccount::new(spl_token::ID, Pubkey::default(), 0, vec![]),
+            pyth_index: TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, pyth_data.clone()),
+            pyth_col: TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, pyth_data),
+            clock: TestAccount::new(solana_program::sysvar::clock::id(), solana_program::sysvar::id(), 0, make_clock(100)),
+            rent: TestAccount::new(solana_program::sysvar::rent::id(), solana_program::sysvar::id(), 0, vec![]),
+            system: TestAccount::new(solana_program::system_program::id(), Pubkey::default(), 0, vec![]),
+            vault_pda,
+        }
+    }
+
+    // --- Encoders --- 
+    
+    fn encode_u64(val: u64, buf: &mut Vec<u8>) { buf.extend_from_slice(&val.to_le_bytes()); }
+    fn encode_u16(val: u16, buf: &mut Vec<u8>) { buf.extend_from_slice(&val.to_le_bytes()); }
+    fn encode_i128(val: i128, buf: &mut Vec<u8>) { buf.extend_from_slice(&val.to_le_bytes()); }
+    fn encode_u128(val: u128, buf: &mut Vec<u8>) { buf.extend_from_slice(&val.to_le_bytes()); }
+    fn encode_pubkey(val: &Pubkey, buf: &mut Vec<u8>) { buf.extend_from_slice(val.as_ref()); }
+
+    fn encode_init_market(fixture: &MarketFixture, crank_staleness: u64) -> Vec<u8> {
+        let mut data = vec![0u8];
+        encode_pubkey(&fixture.admin.key, &mut data);
+        encode_pubkey(&fixture.mint.key, &mut data);
+        encode_pubkey(&fixture.pyth_index.key, &mut data);
+        encode_pubkey(&fixture.pyth_col.key, &mut data);
+        encode_u64(100, &mut data);
+        encode_u16(500, &mut data);
+        
+        encode_u64(0, &mut data);
+        encode_u64(0, &mut data);
+        encode_u64(0, &mut data);
+        encode_u64(0, &mut data);
+        encode_u64(64, &mut data);
+        encode_u128(0, &mut data);
+        encode_u128(0, &mut data);
+        encode_u128(0, &mut data);
+        encode_u64(crank_staleness, &mut data);
+        encode_u64(0, &mut data);
+        encode_u128(0, &mut data);
+        encode_u64(0, &mut data);
+        encode_u128(0, &mut data);
+        data
+    }
+
+    fn encode_init_user(fee: u64) -> Vec<u8> {
+        let mut data = vec![1u8];
+        encode_u64(fee, &mut data);
+        data
+    }
+
+    fn encode_init_lp(matcher: Pubkey, ctx: Pubkey, fee: u64) -> Vec<u8> {
+        let mut data = vec![2u8];
+        encode_pubkey(&matcher, &mut data);
+        encode_pubkey(&ctx, &mut data);
+        encode_u64(fee, &mut data);
+        data
+    }
+
+    fn encode_deposit(user_idx: u16, amount: u64) -> Vec<u8> {
+        let mut data = vec![3u8];
+        encode_u16(user_idx, &mut data);
+        encode_u64(amount, &mut data);
+        data
+    }
+
+    fn encode_withdraw(user_idx: u16, amount: u64) -> Vec<u8> {
+        let mut data = vec![4u8];
+        encode_u16(user_idx, &mut data);
+        encode_u64(amount, &mut data);
+        data
+    }
+
+    fn encode_crank(caller: u16, rate: i64, panic: u8) -> Vec<u8> {
+        let mut data = vec![5u8];
+        encode_u16(caller, &mut data);
+        data.extend_from_slice(&rate.to_le_bytes());
+        data.push(panic);
+        data
+    }
+
+    fn encode_trade(lp: u16, user: u16, size: i128) -> Vec<u8> {
+        let mut data = vec![6u8];
+        encode_u16(lp, &mut data);
+        encode_u16(user, &mut data);
+        encode_i128(size, &mut data);
+        data
+    }
+
+    fn find_idx_by_owner(data: &[u8], owner: Pubkey) -> Option<u16> {
+        let engine = zc::engine_ref(data).ok()?;
+        for i in 0..MAX_ACCOUNTS {
+            if engine.is_used(i) && engine.accounts[i].owner == owner.to_bytes() {
+                return Some(i as u16);
+            }
+        }
+        None
+    }
+
+    // --- Tests ---
+
+    #[test]
+    fn test_init_market() {
+        let mut f = setup_market();
+        let data = encode_init_market(&f, 100);
+        
+        {
+            let mut dummy_ata = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
+            let accounts = vec![
+                f.admin.to_info(), f.slab.to_info(), f.mint.to_info(), f.vault.to_info(), f.token_prog.to_info(),
+                dummy_ata.to_info(), f.system.to_info(), f.rent.to_info(), f.pyth_index.to_info(), f.pyth_col.to_info(), f.clock.to_info(),
+            ];
+            process_instruction(&f.program_id, &accounts, &data).unwrap();
+        }
+
+        let header = state::read_header(&f.slab.data);
+        assert_eq!(header.magic, MAGIC);
+        assert_eq!(header.version, VERSION);
+        
+        let engine = zc::engine_ref(&f.slab.data).unwrap();
+        assert_eq!(engine.params.max_accounts, 64);
+    }
+
+    #[test]
+    fn test_init_user() {
+        let mut f = setup_market();
+        let init_data = encode_init_market(&f, 100);
+        {
+            let mut dummy_ata = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
+            let init_accounts = vec![
+                f.admin.to_info(), f.slab.to_info(), f.mint.to_info(), f.vault.to_info(),
+                f.token_prog.to_info(), dummy_ata.to_info(),
+                f.system.to_info(), f.rent.to_info(), f.pyth_index.to_info(), f.pyth_col.to_info(), f.clock.to_info()
+            ];
+            process_instruction(&f.program_id, &init_accounts, &init_data).unwrap();
+        }
+
+        let mut user = TestAccount::new(Pubkey::new_unique(), solana_program::system_program::id(), 0, vec![]).signer();
+        let mut user_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0, make_token_account(f.mint.key, user.key, 1000)).writable();
+
+        let data = encode_init_user(100);
+        {
+            let accounts = vec![
+                user.to_info(), f.slab.to_info(), user_ata.to_info(), f.vault.to_info(), f.token_prog.to_info(),
+                f.clock.to_info(), f.pyth_col.to_info(),
+            ];
+            process_instruction(&f.program_id, &accounts, &data).unwrap();
+        }
+
+        let vault_state = TokenAccount::unpack(&f.vault.data).unwrap();
+        assert_eq!(vault_state.amount, 100); 
+        assert!(find_idx_by_owner(&f.slab.data, user.key).is_some());
+    }
+
+    #[test]
+    fn test_deposit_withdraw() {
+        let mut f = setup_market();
+        let init_data = encode_init_market(&f, 0); 
+        {
+            let mut dummy_ata = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
+            let init_accounts = vec![
+                f.admin.to_info(), f.slab.to_info(), f.mint.to_info(), f.vault.to_info(),
+                f.token_prog.to_info(), dummy_ata.to_info(),
+                f.system.to_info(), f.rent.to_info(), f.pyth_index.to_info(), f.pyth_col.to_info(), f.clock.to_info()
+            ];
+            process_instruction(&f.program_id, &init_accounts, &init_data).unwrap();
+        }
+
+        let mut user = TestAccount::new(Pubkey::new_unique(), solana_program::system_program::id(), 0, vec![]).signer();
+        let mut user_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0, make_token_account(f.mint.key, user.key, 1000)).writable();
+        {
+            let accounts = vec![
+                user.to_info(), f.slab.to_info(), user_ata.to_info(), f.vault.to_info(), f.token_prog.to_info(),
+                f.clock.to_info(), f.pyth_col.to_info()
+            ];
+            process_instruction(&f.program_id, &accounts, &encode_init_user(0)).unwrap();
+        }
+        let user_idx = find_idx_by_owner(&f.slab.data, user.key).unwrap();
+
+        {
+            let accounts = vec![
+                user.to_info(), f.slab.to_info(), user_ata.to_info(), f.vault.to_info(), f.token_prog.to_info()
+            ];
+            process_instruction(&f.program_id, &accounts, &encode_deposit(user_idx, 500)).unwrap();
+        }
+
+        {
+            let accounts = vec![
+                user.to_info(), f.slab.to_info(), f.clock.to_info(), f.pyth_col.to_info()
+            ];
+            process_instruction(&f.program_id, &accounts, &encode_crank(user_idx, 0, 0)).unwrap();
+        }
+
+        {
+            let mut vault_pda_account = TestAccount::new(f.vault_pda, solana_program::system_program::id(), 0, vec![]);
+            let accounts = vec![
+                user.to_info(), f.slab.to_info(), f.vault.to_info(), user_ata.to_info(), vault_pda_account.to_info(),
+                f.token_prog.to_info(), f.clock.to_info(), f.pyth_index.to_info(),
+            ];
+            process_instruction(&f.program_id, &accounts, &encode_withdraw(user_idx, 200)).unwrap();
+        }
+
+        let vault_state = TokenAccount::unpack(&f.vault.data).unwrap();
+        assert_eq!(vault_state.amount, 300);
+    }
+
+    #[test]
+    fn test_vault_validation() {
+        let mut f = setup_market();
+        f.vault.owner = solana_program::system_program::id();
+        let init_data = encode_init_market(&f, 100);
+        let mut dummy_ata = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
+        let init_accounts = vec![
+            f.admin.to_info(), f.slab.to_info(), f.mint.to_info(), f.vault.to_info(),
+            f.token_prog.to_info(), dummy_ata.to_info(),
+            f.system.to_info(), f.rent.to_info(), f.pyth_index.to_info(), f.pyth_col.to_info(), f.clock.to_info()
+        ];
+        let res = process_instruction(&f.program_id, &init_accounts, &init_data);
+        assert_eq!(res, Err(PercolatorError::InvalidVaultAta.into()));
+    }
+
+    #[test]
+    fn test_trade() {
+        let mut f = setup_market();
+        let init_data = encode_init_market(&f, 100);
+        {
+            let mut dummy_ata = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
+            let init_accounts = vec![
+                f.admin.to_info(), f.slab.to_info(), f.mint.to_info(), f.vault.to_info(),
+                f.token_prog.to_info(), dummy_ata.to_info(),
+                f.system.to_info(), f.rent.to_info(), f.pyth_index.to_info(), f.pyth_col.to_info(), f.clock.to_info()
+            ];
+            process_instruction(&f.program_id, &init_accounts, &init_data).unwrap();
+        }
+
+        let mut user = TestAccount::new(Pubkey::new_unique(), solana_program::system_program::id(), 0, vec![]).signer();
+        let mut user_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0, make_token_account(f.mint.key, user.key, 1000)).writable();
+        {
+            let accounts = vec![
+                user.to_info(), f.slab.to_info(), user_ata.to_info(), f.vault.to_info(), f.token_prog.to_info(),
+                f.clock.to_info(), f.pyth_col.to_info()
+            ];
+            process_instruction(&f.program_id, &accounts, &encode_init_user(0)).unwrap();
+        }
+        let user_idx = find_idx_by_owner(&f.slab.data, user.key).unwrap();
+        {
+            let accounts = vec![user.to_info(), f.slab.to_info(), user_ata.to_info(), f.vault.to_info(), f.token_prog.to_info()];
+            process_instruction(&f.program_id, &accounts, &encode_deposit(user_idx, 1000)).unwrap();
+        }
+
+        let mut lp = TestAccount::new(Pubkey::new_unique(), solana_program::system_program::id(), 0, vec![]).signer();
+        let mut lp_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0, make_token_account(f.mint.key, lp.key, 1000)).writable();
+        let mut d1 = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
+        let mut d2 = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
+        {
+            let accounts = vec![
+                lp.to_info(), f.slab.to_info(), lp_ata.to_info(), f.vault.to_info(), f.token_prog.to_info(),
+                d1.to_info(), d2.to_info()
+            ];
+            process_instruction(&f.program_id, &accounts, &encode_init_lp(Pubkey::default(), Pubkey::default(), 0)).unwrap();
+        }
+        let lp_idx = find_idx_by_owner(&f.slab.data, lp.key).unwrap();
+        {
+            let accounts = vec![lp.to_info(), f.slab.to_info(), lp_ata.to_info(), f.vault.to_info(), f.token_prog.to_info()];
+            process_instruction(&f.program_id, &accounts, &encode_deposit(lp_idx, 1000)).unwrap();
+        }
+
+        {
+            let accounts = vec![
+                user.to_info(), lp.to_info(), f.slab.to_info(), f.clock.to_info(), f.pyth_col.to_info()
+            ];
+            process_instruction(&f.program_id, &accounts, &encode_trade(lp_idx, user_idx, 100)).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_withdraw_wrong_signer() {
+        let mut f = setup_market();
+        let init_data = encode_init_market(&f, 0);
+        {
+            let mut dummy = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
+            let accs = vec![
+                f.admin.to_info(), f.slab.to_info(), f.mint.to_info(), f.vault.to_info(), f.token_prog.to_info(),
+                dummy.to_info(), f.system.to_info(), f.rent.to_info(), f.pyth_index.to_info(), f.pyth_col.to_info(), f.clock.to_info()
+            ];
+            process_instruction(&f.program_id, &accs, &init_data).unwrap();
+        }
+
+        let mut user = TestAccount::new(Pubkey::new_unique(), solana_program::system_program::id(), 0, vec![]).signer();
+        let mut user_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0, make_token_account(f.mint.key, user.key, 1000)).writable();
+        {
+            let accounts = vec![
+                user.to_info(), f.slab.to_info(), user_ata.to_info(), f.vault.to_info(), f.token_prog.to_info(),
+                f.clock.to_info(), f.pyth_col.to_info()
+            ];
+            process_instruction(&f.program_id, &accounts, &encode_init_user(0)).unwrap();
+        }
+        let user_idx = find_idx_by_owner(&f.slab.data, user.key).unwrap();
+
+        let mut attacker = TestAccount::new(Pubkey::new_unique(), solana_program::system_program::id(), 0, vec![]).signer();
+        let mut vault_pda = TestAccount::new(f.vault_pda, solana_program::system_program::id(), 0, vec![]);
+        
+        let accounts = vec![
+            attacker.to_info(),
+            f.slab.to_info(), f.vault.to_info(), user_ata.to_info(), vault_pda.to_info(),
+            f.token_prog.to_info(), f.clock.to_info(), f.pyth_index.to_info()
+        ];
+        
+        let res = process_instruction(&f.program_id, &accounts, &encode_withdraw(user_idx, 100));
+        assert_eq!(res, Err(PercolatorError::EngineUnauthorized.into()));
+    }
+
+    #[test]
+    fn test_trade_wrong_signer() {
+        let mut f = setup_market();
+        let init_data = encode_init_market(&f, 100);
+        {
+            let mut dummy = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
+            let accs = vec![
+                f.admin.to_info(), f.slab.to_info(), f.mint.to_info(), f.vault.to_info(), f.token_prog.to_info(),
+                dummy.to_info(), f.system.to_info(), f.rent.to_info(), f.pyth_index.to_info(), f.pyth_col.to_info(), f.clock.to_info()
+            ];
+            process_instruction(&f.program_id, &accs, &init_data).unwrap();
+        }
+
+        let mut user = TestAccount::new(Pubkey::new_unique(), solana_program::system_program::id(), 0, vec![]).signer();
+        let mut user_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0, make_token_account(f.mint.key, user.key, 1000)).writable();
+        {
+            let accs = vec![
+                user.to_info(), f.slab.to_info(), user_ata.to_info(), f.vault.to_info(), f.token_prog.to_info(),
+                f.clock.to_info(), f.pyth_col.to_info()
+            ];
+            process_instruction(&f.program_id, &accs, &encode_init_user(0)).unwrap();
+        }
+        let user_idx = find_idx_by_owner(&f.slab.data, user.key).unwrap();
+
+        let mut lp = TestAccount::new(Pubkey::new_unique(), solana_program::system_program::id(), 0, vec![]).signer();
+        let mut lp_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0, make_token_account(f.mint.key, lp.key, 1000)).writable();
+        let mut d1 = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
+        let mut d2 = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
+        {
+            let accs = vec![
+                lp.to_info(), f.slab.to_info(), lp_ata.to_info(), f.vault.to_info(), f.token_prog.to_info(), d1.to_info(), d2.to_info()
+            ];
+            process_instruction(&f.program_id, &accs, &encode_init_lp(Pubkey::default(), Pubkey::default(), 0)).unwrap();
+        }
+        let lp_idx = find_idx_by_owner(&f.slab.data, lp.key).unwrap();
+
+        let mut attacker = TestAccount::new(Pubkey::new_unique(), solana_program::system_program::id(), 0, vec![]).signer();
+        {
+            let accs = vec![
+                attacker.to_info(), lp.to_info(), f.slab.to_info(), f.clock.to_info(), f.pyth_col.to_info()
+            ];
+            let res = process_instruction(&f.program_id, &accs, &encode_trade(lp_idx, user_idx, 100));
+            assert_eq!(res, Err(PercolatorError::EngineUnauthorized.into()));
+        }
+    }
 }
