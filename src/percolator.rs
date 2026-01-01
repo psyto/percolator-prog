@@ -27,6 +27,7 @@ pub mod constants {
     pub const ENGINE_OFF: usize = align_up(HEADER_LEN + CONFIG_LEN, ENGINE_ALIGN);
     pub const ENGINE_LEN: usize = size_of::<RiskEngine>();
     pub const SLAB_LEN: usize = ENGINE_OFF + ENGINE_LEN;
+    pub const MATCHER_CONTEXT_LEN: usize = 24;
 }
 
 // 2. mod zc (Zero-Copy unsafe island)
@@ -157,6 +158,7 @@ pub mod ix {
         LiquidateAtOracle { target_idx: u16 },
         CloseAccount { user_idx: u16 },
         TopUpInsurance { amount: u64 },
+        TradeCpi { lp_idx: u16, user_idx: u16, size: i128 },
     }
 
     impl Instruction {
@@ -220,6 +222,12 @@ pub mod ix {
                 9 => { // TopUpInsurance
                     let amount = read_u64(&mut rest)?;
                     Ok(Instruction::TopUpInsurance { amount })
+                },
+                10 => { // TradeCpi
+                    let lp_idx = read_u16(&mut rest)?;
+                    let user_idx = read_u16(&mut rest)?;
+                    let size = read_i128(&mut rest)?;
+                    Ok(Instruction::TradeCpi { lp_idx, user_idx, size })
                 },
                 _ => Err(ProgramError::InvalidInstructionData),
             }
@@ -551,13 +559,29 @@ pub mod processor {
         ix::Instruction,
         state::{self, SlabHeader, MarketConfig},
         accounts,
-        constants::{MAGIC, VERSION, SLAB_LEN, CONFIG_LEN},
+        constants::{MAGIC, VERSION, SLAB_LEN, CONFIG_LEN, MATCHER_CONTEXT_LEN},
         error::{PercolatorError, map_risk_error},
         oracle,
         collateral,
         zc,
     };
-    use percolator::{RiskEngine, NoOpMatcher, MAX_ACCOUNTS};
+    use percolator::{RiskEngine, NoOpMatcher, MAX_ACCOUNTS, MatchingEngine, TradeExecution, RiskError};
+    use solana_program::instruction::{Instruction as SolInstruction, AccountMeta};
+    use solana_program::program::invoke_signed;
+
+    struct CpiMatcher {
+        exec_price: u64,
+        exec_size: i128,
+    }
+
+    impl MatchingEngine for CpiMatcher {
+        fn execute_match(&self, _slab: &[u8; 32], _lp: &[u8; 32], _lp_id: u64, _price: u64, _size: i128) -> Result<TradeExecution, RiskError> {
+            Ok(TradeExecution {
+                price: self.exec_price,
+                size: self.exec_size,
+            })
+        }
+    }
 
     fn slab_guard(program_id: &Pubkey, slab: &AccountInfo, data: &[u8]) -> Result<(), ProgramError> {
         accounts::expect_owner(slab, program_id)?;
@@ -863,6 +887,92 @@ pub mod processor {
                 let price = oracle::read_pyth_price_e6(&accounts[4], clock.slot, config.max_staleness_slots, config.conf_filter_bps)?;
 
                 engine.execute_trade(&NoOpMatcher, lp_idx, user_idx, clock.slot, price, size).map_err(map_risk_error)?;
+            },
+            Instruction::TradeCpi { lp_idx, user_idx, size } => {
+                accounts::expect_len(accounts, 8)?;
+                let a_user = &accounts[0];
+                let a_lp = &accounts[1];
+                let a_slab = &accounts[2];
+                let a_clock = &accounts[3];
+                let a_oracle = &accounts[4];
+                let a_matcher = &accounts[5];
+                let a_context = &accounts[6];
+                let a_lp_signer = &accounts[7];
+
+                accounts::expect_signer(a_user)?;
+                accounts::expect_signer(a_lp)?;
+                accounts::expect_writable(a_slab)?;
+                accounts::expect_writable(a_context)?;
+                accounts::expect_signer(a_lp_signer)?;
+
+                let mut data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &data)?;
+                require_initialized(&data)?;
+                let config = state::read_config(&data);
+
+                let engine = zc::engine_mut(&mut data)?;
+
+                check_idx(engine, lp_idx)?;
+                check_idx(engine, user_idx)?;
+
+                let u_owner = engine.accounts[user_idx as usize].owner;
+                if Pubkey::new_from_array(u_owner) != *a_user.key { return Err(PercolatorError::EngineUnauthorized.into()); }
+                let l_owner = engine.accounts[lp_idx as usize].owner;
+                if Pubkey::new_from_array(l_owner) != *a_lp.key { return Err(PercolatorError::EngineUnauthorized.into()); }
+
+                let lp_bytes = lp_idx.to_le_bytes();
+                let (lp_pda, bump) = Pubkey::find_program_address(
+                    &[b"lp", a_slab.key.as_ref(), &lp_bytes],
+                    program_id
+                );
+                if *a_lp_signer.key != lp_pda {
+                    return Err(PercolatorError::EngineUnauthorized.into());
+                }
+
+                let clock = Clock::from_account_info(a_clock)?;
+                let price = oracle::read_pyth_price_e6(a_oracle, clock.slot, config.max_staleness_slots, config.conf_filter_bps)?;
+
+                let lp_account_id = engine.accounts[lp_idx as usize].account_id;
+                
+                let mut cpi_data = alloc::vec::Vec::with_capacity(51);
+                cpi_data.push(0);
+                cpi_data.extend_from_slice(a_slab.key.as_ref());
+                cpi_data.extend_from_slice(&lp_idx.to_le_bytes());
+                cpi_data.extend_from_slice(&lp_account_id.to_le_bytes());
+                cpi_data.extend_from_slice(&price.to_le_bytes());
+                cpi_data.extend_from_slice(&size.to_le_bytes());
+
+                let mut metas = alloc::vec![
+                    AccountMeta::new_readonly(*a_slab.key, false),
+                    AccountMeta::new(*a_lp_signer.key, true),
+                    AccountMeta::new(*a_context.key, false),
+                ];
+                for i in 8..accounts.len() {
+                    let acc = &accounts[i];
+                    metas.push(if acc.is_writable { AccountMeta::new(*acc.key, acc.is_signer) } else { AccountMeta::new_readonly(*acc.key, acc.is_signer) });
+                }
+
+                let ix = SolInstruction {
+                    program_id: *a_matcher.key,
+                    accounts: metas,
+                    data: cpi_data,
+                };
+
+                let bump_arr = [bump];
+                let seeds: &[&[u8]] = &[b"lp", a_slab.key.as_ref(), &lp_bytes, &bump_arr];
+                
+                invoke_signed(&ix, accounts, &[seeds])?;
+
+                if a_context.data_len() < MATCHER_CONTEXT_LEN {
+                    return Err(ProgramError::InvalidAccountData);
+                }
+                let ctx_data = a_context.try_borrow_data()?;
+                let exec_price = u64::from_le_bytes(ctx_data[0..8].try_into().unwrap());
+                let exec_size = i128::from_le_bytes(ctx_data[8..24].try_into().unwrap());
+                drop(ctx_data);
+
+                let matcher = CpiMatcher { exec_price, exec_size };
+                engine.execute_trade(&matcher, lp_idx, user_idx, clock.slot, price, size).map_err(map_risk_error)?;
             },
             Instruction::LiquidateAtOracle { target_idx } => {
                 accounts::expect_len(accounts, 4)?;
