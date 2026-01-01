@@ -1381,6 +1381,22 @@ mod tests {
         }
         let user_idx = find_idx_by_owner(&f.slab.data, user.key).unwrap();
 
+        // Deposit
+        {
+            let accounts = vec![
+                user.to_info(), f.slab.to_info(), user_ata.to_info(), f.vault.to_info(), f.token_prog.to_info()
+            ];
+            process_instruction(&f.program_id, &accounts, &encode_deposit(user_idx, 500)).unwrap();
+        }
+
+        // Crank
+        {
+            let accs = vec![
+                user.to_info(), f.slab.to_info(), f.clock.to_info(), f.pyth_col.to_info()
+            ];
+            process_instruction(&f.program_id, &accs, &encode_crank(user_idx, 0, 0)).unwrap();
+        }
+
         let mut attacker = TestAccount::new(Pubkey::new_unique(), solana_program::system_program::id(), 0, vec![]).signer();
         let mut vault_pda = TestAccount::new(f.vault_pda, solana_program::system_program::id(), 0, vec![]);
         
@@ -1397,7 +1413,7 @@ mod tests {
     #[test]
     fn test_trade_wrong_signer() {
         let mut f = setup_market();
-        let init_data = encode_init_market(&f, 100);
+        let init_data = encode_init_market(&f, 0);
         {
             let mut dummy = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
             let accs = vec![
@@ -1429,6 +1445,30 @@ mod tests {
             process_instruction(&f.program_id, &accs, &encode_init_lp(Pubkey::default(), Pubkey::default(), 0)).unwrap();
         }
         let lp_idx = find_idx_by_owner(&f.slab.data, lp.key).unwrap();
+
+        // Deposit User
+        {
+            let accs = vec![
+                user.to_info(), f.slab.to_info(), user_ata.to_info(), f.vault.to_info(), f.token_prog.to_info()
+            ];
+            process_instruction(&f.program_id, &accs, &encode_deposit(user_idx, 1000)).unwrap();
+        }
+
+        // Deposit LP
+        {
+            let accs = vec![
+                lp.to_info(), f.slab.to_info(), lp_ata.to_info(), f.vault.to_info(), f.token_prog.to_info()
+            ];
+            process_instruction(&f.program_id, &accs, &encode_deposit(lp_idx, 1000)).unwrap();
+        }
+
+        // Crank
+        {
+            let accs = vec![
+                user.to_info(), f.slab.to_info(), f.clock.to_info(), f.pyth_col.to_info()
+            ];
+            process_instruction(&f.program_id, &accs, &encode_crank(user_idx, 0, 0)).unwrap();
+        }
 
         let mut attacker = TestAccount::new(Pubkey::new_unique(), solana_program::system_program::id(), 0, vec![]).signer();
         {
