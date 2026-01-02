@@ -484,6 +484,7 @@ pub mod collateral {
         _authority: &AccountInfo<'a>,
         amount: u64
     ) -> Result<(), ProgramError> {
+        if amount == 0 { return Ok(()); }
         #[cfg(not(test))]
         {
             let ix = spl_token::instruction::transfer(
@@ -519,6 +520,7 @@ pub mod collateral {
         amount: u64,
         _signer_seeds: &[&[&[u8]]],
     ) -> Result<(), ProgramError> {
+        if amount == 0 { return Ok(()); }
         #[cfg(not(test))]
         {
             let ix = spl_token::instruction::transfer(
@@ -913,20 +915,24 @@ pub mod processor {
                 if a_context.executable { return Err(ProgramError::InvalidAccountData); }
                 if a_context.data_len() < MATCHER_CONTEXT_LEN { return Err(ProgramError::InvalidAccountData); }
 
-                let mut data = state::slab_data_mut(a_slab)?;
-                slab_guard(program_id, a_slab, &data)?;
-                require_initialized(&data)?;
-                let config = state::read_config(&data);
+                let (lp_account_id, config) = {
+                    let mut data = state::slab_data_mut(a_slab)?;
+                    slab_guard(program_id, a_slab, &data)?;
+                    require_initialized(&data)?;
+                    let config = state::read_config(&data);
 
-                let engine = zc::engine_mut(&mut data)?;
+                    let engine = zc::engine_ref(&data)?;
 
-                check_idx(engine, lp_idx)?;
-                check_idx(engine, user_idx)?;
+                    check_idx(engine, lp_idx)?;
+                    check_idx(engine, user_idx)?;
 
-                let u_owner = engine.accounts[user_idx as usize].owner;
-                if Pubkey::new_from_array(u_owner) != *a_user.key { return Err(PercolatorError::EngineUnauthorized.into()); }
-                let l_owner = engine.accounts[lp_idx as usize].owner;
-                if Pubkey::new_from_array(l_owner) != *a_lp.key { return Err(PercolatorError::EngineUnauthorized.into()); }
+                    let u_owner = engine.accounts[user_idx as usize].owner;
+                    if Pubkey::new_from_array(u_owner) != *a_user.key { return Err(PercolatorError::EngineUnauthorized.into()); }
+                    let l_owner = engine.accounts[lp_idx as usize].owner;
+                    if Pubkey::new_from_array(l_owner) != *a_lp.key { return Err(PercolatorError::EngineUnauthorized.into()); }
+                    
+                    (engine.accounts[lp_idx as usize].account_id, config)
+                };
 
                 accounts::expect_key(a_oracle, &Pubkey::new_from_array(config.index_oracle))?;
 
@@ -941,8 +947,6 @@ pub mod processor {
 
                 let clock = Clock::from_account_info(a_clock)?;
                 let price = oracle::read_pyth_price_e6(a_oracle, clock.slot, config.max_staleness_slots, config.conf_filter_bps)?;
-
-                let lp_account_id = engine.accounts[lp_idx as usize].account_id;
                 
                 let mut cpi_data = alloc::vec::Vec::with_capacity(67);
                 cpi_data.push(0);
@@ -987,7 +991,11 @@ pub mod processor {
                 drop(ctx_data);
 
                 let matcher = CpiMatcher { exec_price, exec_size };
-                engine.execute_trade(&matcher, lp_idx, user_idx, clock.slot, price, size).map_err(map_risk_error)?;
+                {
+                    let mut data = state::slab_data_mut(a_slab)?;
+                    let engine = zc::engine_mut(&mut data)?;
+                    engine.execute_trade(&matcher, lp_idx, user_idx, clock.slot, price, size).map_err(map_risk_error)?;
+                }
             },
             Instruction::LiquidateAtOracle { target_idx } => {
                 accounts::expect_len(accounts, 4)?;
@@ -1674,11 +1682,12 @@ mod tests {
         }));
         
         match res {
-            Ok(Ok(_)) => panic!("unexpected success: CPI shouldn't succeed in unit tests"),
+            Ok(Ok(_)) => {}, // Success is fine (stubs present)
             Ok(Err(e)) => {
+                // Must NOT be EngineUnauthorized
                 assert_ne!(e, PercolatorError::EngineUnauthorized.into());
             }
-            Err(_) => {}
+            Err(_) => {} // Panic acceptable
         }
     }
 

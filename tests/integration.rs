@@ -1,0 +1,366 @@
+// tests/integration.rs
+use solana_program::{
+    account_info::AccountInfo,
+    entrypoint::ProgramResult,
+    program_error::ProgramError,
+    program_pack::Pack,
+    pubkey::Pubkey,
+};
+use solana_program_test::{processor, ProgramTest};
+use solana_sdk::{
+    account::Account,
+    instruction::{AccountMeta, Instruction},
+    signature::{Keypair, Signer},
+    system_instruction,
+    transaction::Transaction,
+};
+use std::convert::TryInto;
+
+use percolator_prog::{
+    constants::{SLAB_LEN, MATCHER_CONTEXT_LEN},
+    processor as percolator_processor,
+};
+
+pub const PERCOLATOR_ID: Pubkey = solana_program::pubkey!("Perco1ator111111111111111111111111111111111");
+
+/// ------------------------
+/// Mock matcher "program"
+/// ------------------------
+fn matcher_mock_process_instruction(
+    _program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+) -> ProgramResult {
+    if accounts.len() < 3 {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    }
+    let a_slab = &accounts[0];
+    let a_lp_pda = &accounts[1];
+    let a_ctx = &accounts[2];
+
+    if !a_lp_pda.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if !a_ctx.is_writable {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if a_ctx.data_len() < MATCHER_CONTEXT_LEN {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    if data.len() != 67 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let tag = data[0];
+    if tag != 0 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let slab_pk = Pubkey::new_from_array(data[1..33].try_into().unwrap());
+    if slab_pk != *a_slab.key {
+        return Err(ProgramError::InvalidArgument);
+    }
+
+    let oracle_price_e6 = u64::from_le_bytes(data[43..51].try_into().unwrap());
+    let req_size = i128::from_le_bytes(data[51..67].try_into().unwrap());
+
+    {
+        let mut ctx = a_ctx.try_borrow_mut_data()?;
+        ctx[0..8].copy_from_slice(&oracle_price_e6.to_le_bytes());
+        ctx[8..24].copy_from_slice(&req_size.to_le_bytes());
+    }
+
+    Ok(())
+}
+
+fn make_pyth(price: i64, expo: i32, conf: u64, pub_slot: u64) -> Vec<u8> {
+    let mut data = vec![0u8; 208];
+    data[20..24].copy_from_slice(&expo.to_le_bytes());
+    data[176..184].copy_from_slice(&price.to_le_bytes());
+    data[184..192].copy_from_slice(&conf.to_le_bytes());
+    data[200..208].copy_from_slice(&pub_slot.to_le_bytes());
+    data
+}
+
+fn encode_init_market(
+    admin: &Pubkey,
+    mint: &Pubkey,
+    pyth_index: &Pubkey,
+    pyth_collateral: &Pubkey,
+    max_staleness: u64,
+    conf_bps: u16,
+    crank_staleness: u64,
+) -> Vec<u8> {
+    let mut v = vec![0u8];
+    v.extend_from_slice(admin.as_ref());
+    v.extend_from_slice(mint.as_ref());
+    v.extend_from_slice(pyth_index.as_ref());
+    v.extend_from_slice(pyth_collateral.as_ref());
+    v.extend_from_slice(&max_staleness.to_le_bytes());
+    v.extend_from_slice(&conf_bps.to_le_bytes());
+
+    v.extend_from_slice(&0u64.to_le_bytes()); // warmup
+    v.extend_from_slice(&0u64.to_le_bytes()); // maint
+    v.extend_from_slice(&0u64.to_le_bytes()); // init
+    v.extend_from_slice(&0u64.to_le_bytes()); // trade
+    v.extend_from_slice(&64u64.to_le_bytes()); // max_accounts
+    v.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
+    v.extend_from_slice(&0u128.to_le_bytes()); // risk_threshold
+    v.extend_from_slice(&0u128.to_le_bytes()); // maint_fee_per_slot
+    v.extend_from_slice(&crank_staleness.to_le_bytes()); // max_crank_staleness_slots
+    v.extend_from_slice(&0u64.to_le_bytes()); // liq_fee_bps
+    v.extend_from_slice(&0u128.to_le_bytes()); // liq_fee_cap
+    v.extend_from_slice(&0u64.to_le_bytes()); // liq_buffer_bps
+    v.extend_from_slice(&0u128.to_le_bytes()); // min_liq_abs
+    v
+}
+
+fn encode_init_user(fee: u64) -> Vec<u8> {
+    let mut v = vec![1u8];
+    v.extend_from_slice(&fee.to_le_bytes());
+    v
+}
+
+fn encode_init_lp(matcher_program: &Pubkey, matcher_ctx: &Pubkey, fee: u64) -> Vec<u8> {
+    let mut v = vec![2u8];
+    v.extend_from_slice(matcher_program.as_ref());
+    v.extend_from_slice(matcher_ctx.as_ref());
+    v.extend_from_slice(&fee.to_le_bytes());
+    v
+}
+
+fn encode_crank(caller_idx: u16, rate: i64, allow_panic: u8) -> Vec<u8> {
+    let mut v = vec![5u8];
+    v.extend_from_slice(&caller_idx.to_le_bytes());
+    v.extend_from_slice(&rate.to_le_bytes());
+    v.push(allow_panic);
+    v
+}
+
+fn encode_trade_cpi(lp_idx: u16, user_idx: u16, size: i128) -> Vec<u8> {
+    let mut v = vec![10u8];
+    v.extend_from_slice(&lp_idx.to_le_bytes());
+    v.extend_from_slice(&user_idx.to_le_bytes());
+    v.extend_from_slice(&size.to_le_bytes());
+    v
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn integration_trade_cpi_lp_pda_is_signer() {
+    let percolator_id = PERCOLATOR_ID;
+    let matcher_id = Pubkey::new_unique();
+
+    let mut pt = ProgramTest::new(
+        "percolator_prog",
+        percolator_id,
+        processor!(percolator_processor::process_instruction),
+    );
+    pt.add_program(
+        "matcher_mock",
+        matcher_id,
+        processor!(matcher_mock_process_instruction),
+    );
+
+    let admin = Keypair::new();
+    let user = Keypair::new();
+    let lp = Keypair::new();
+
+    let slab = Keypair::new();
+    let mint = Pubkey::new_unique(); 
+    let pyth_index = Pubkey::new_unique();
+    let pyth_collateral = Pubkey::new_unique();
+    let matcher_ctx = Keypair::new();
+
+    let (vault_auth, _vault_bump) =
+        Pubkey::find_program_address(&[b"vault", slab.pubkey().as_ref()], &percolator_id);
+    let vault = Keypair::new();
+
+    pt.add_account(
+        slab.pubkey(),
+        Account {
+            lamports: 10_000_000_000,
+            data: vec![0u8; SLAB_LEN],
+            owner: percolator_id,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+
+    let mut vault_data = vec![0u8; spl_token::state::Account::LEN];
+    let mut vault_state = spl_token::state::Account::default();
+    vault_state.mint = mint;
+    vault_state.owner = vault_auth;
+    vault_state.amount = 0;
+    vault_state.state = spl_token::state::AccountState::Initialized;
+    spl_token::state::Account::pack(vault_state, &mut vault_data).unwrap();
+
+    pt.add_account(
+        vault.pubkey(),
+        Account {
+            lamports: 1_000_000_000,
+            data: vault_data,
+            owner: spl_token::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+
+    pt.add_account(
+        pyth_index,
+        Account {
+            lamports: 1_000_000_000,
+            data: make_pyth(1_000_000, -6, 1, 0), 
+            owner: Pubkey::new_unique(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+    pt.add_account(
+        pyth_collateral,
+        Account {
+            lamports: 1_000_000_000,
+            data: make_pyth(1_000_000, -6, 1, 0),
+            owner: Pubkey::new_unique(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+
+    pt.add_account(
+        matcher_ctx.pubkey(),
+        Account {
+            lamports: 1_000_000_000,
+            data: vec![0u8; MATCHER_CONTEXT_LEN],
+            owner: matcher_id, // Matcher mock must own this to write to it
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+
+    let (mut banks, payer, recent_hash) = pt.start().await;
+
+    let mut tx = Transaction::new_with_payer(
+        &[
+            system_instruction::transfer(&payer.pubkey(), &admin.pubkey(), 2_000_000_000),
+            system_instruction::transfer(&payer.pubkey(), &user.pubkey(), 2_000_000_000),
+            system_instruction::transfer(&payer.pubkey(), &lp.pubkey(), 2_000_000_000),
+        ],
+        Some(&payer.pubkey()),
+    );
+    tx.sign(&[&payer], recent_hash);
+    banks.process_transaction(tx).await.unwrap();
+
+    // 1. InitMarket
+    let ix = Instruction {
+        program_id: percolator_id,
+        accounts: vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(slab.pubkey(), false),
+            AccountMeta::new_readonly(mint, false),
+            AccountMeta::new(vault.pubkey(), false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(Pubkey::new_unique(), false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            AccountMeta::new_readonly(solana_sdk::sysvar::rent::ID, false),
+            AccountMeta::new_readonly(pyth_index, false),
+            AccountMeta::new_readonly(pyth_collateral, false),
+            AccountMeta::new_readonly(solana_sdk::sysvar::clock::ID, false),
+        ],
+        data: encode_init_market(
+            &admin.pubkey(),
+            &mint,
+            &pyth_index,
+            &pyth_collateral,
+            100,
+            500,
+            100,
+        ),
+    };
+    let mut tx = Transaction::new_with_payer(&[ix], Some(&payer.pubkey()));
+    tx.sign(&[&payer, &admin], banks.get_latest_blockhash().await.unwrap());
+    banks.process_transaction(tx).await.unwrap();
+
+    // 2. InitUser (fee=0)
+    let ix = Instruction {
+        program_id: percolator_id,
+        accounts: vec![
+            AccountMeta::new(user.pubkey(), true),
+            AccountMeta::new(slab.pubkey(), false),
+            AccountMeta::new_readonly(Pubkey::new_unique(), false), 
+            AccountMeta::new(vault.pubkey(), false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(solana_sdk::sysvar::clock::ID, false),
+            AccountMeta::new_readonly(pyth_collateral, false),
+        ],
+        data: encode_init_user(0),
+    };
+    let mut tx = Transaction::new_with_payer(&[ix], Some(&payer.pubkey()));
+    tx.sign(&[&payer, &user], banks.get_latest_blockhash().await.unwrap());
+    banks.process_transaction(tx).await.unwrap();
+
+    // 3. InitLP (fee=0)
+    let ix = Instruction {
+        program_id: percolator_id,
+        accounts: vec![
+            AccountMeta::new(lp.pubkey(), true),
+            AccountMeta::new(slab.pubkey(), false),
+            AccountMeta::new_readonly(Pubkey::new_unique(), false),
+            AccountMeta::new(vault.pubkey(), false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(solana_sdk::sysvar::clock::ID, false),
+            AccountMeta::new_readonly(pyth_collateral, false),
+        ],
+        data: encode_init_lp(&matcher_id, &matcher_ctx.pubkey(), 0),
+    };
+    let mut tx = Transaction::new_with_payer(&[ix], Some(&payer.pubkey()));
+    tx.sign(&[&payer, &lp], banks.get_latest_blockhash().await.unwrap());
+    banks.process_transaction(tx).await.unwrap();
+
+    // 4. KeeperCrank (caller=user, idx=0)
+    let ix = Instruction {
+        program_id: percolator_id,
+        accounts: vec![
+            AccountMeta::new(user.pubkey(), true),
+            AccountMeta::new(slab.pubkey(), false),
+            AccountMeta::new_readonly(solana_sdk::sysvar::clock::ID, false),
+            AccountMeta::new_readonly(pyth_index, false),
+        ],
+        data: encode_crank(0, 0, 0),
+    };
+    let mut tx = Transaction::new_with_payer(&[ix], Some(&payer.pubkey()));
+    tx.sign(&[&payer, &user], banks.get_latest_blockhash().await.unwrap());
+    banks.process_transaction(tx).await.unwrap();
+
+    // 5. TradeCpi
+    let lp_idx = 1u16;
+    let (lp_pda, _) = Pubkey::find_program_address(
+        &[b"lp", slab.pubkey().as_ref(), &lp_idx.to_le_bytes()],
+        &percolator_id
+    );
+
+    let ix = Instruction {
+        program_id: percolator_id,
+        accounts: vec![
+            AccountMeta::new(user.pubkey(), true),
+            AccountMeta::new(lp.pubkey(), true),
+            AccountMeta::new(slab.pubkey(), false),
+            AccountMeta::new_readonly(solana_sdk::sysvar::clock::ID, false),
+            AccountMeta::new_readonly(pyth_index, false),
+            AccountMeta::new_readonly(matcher_id, false),
+            AccountMeta::new(matcher_ctx.pubkey(), false),
+            AccountMeta::new_readonly(lp_pda, false), 
+        ],
+        data: encode_trade_cpi(1, 0, 0), // size 0
+    };
+    let mut tx = Transaction::new_with_payer(&[ix], Some(&payer.pubkey()));
+    tx.sign(&[&payer, &user, &lp], banks.get_latest_blockhash().await.unwrap());
+    banks.process_transaction(tx).await.unwrap();
+
+    // Verify matcher_ctx has data (price 1.0 = 1_000_000, size 0)
+    let ctx_acc = banks.get_account(matcher_ctx.pubkey()).await.unwrap().unwrap();
+    let written_price = u64::from_le_bytes(ctx_acc.data[0..8].try_into().unwrap());
+    let written_size = i128::from_le_bytes(ctx_acc.data[8..24].try_into().unwrap());
+    
+    assert_eq!(written_size, 0, "Size mismatch");
+    assert_eq!(written_price, 1_000_000, "Price mismatch");
+}
