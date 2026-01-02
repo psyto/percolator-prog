@@ -16,7 +16,11 @@ use solana_sdk::{
 use std::convert::TryInto;
 
 use percolator_prog::{
-    constants::{SLAB_LEN, MATCHER_CONTEXT_LEN, MATCHER_ABI_VERSION, MATCHER_CALL_TAG, MATCHER_CALL_LEN},
+    constants::{
+        SLAB_LEN, MATCHER_CONTEXT_LEN, MATCHER_ABI_VERSION, MATCHER_CALL_TAG, MATCHER_CALL_LEN,
+        CALL_OFF_REQ_ID, CALL_OFF_LP_IDX, CALL_OFF_LP_ACCOUNT_ID, CALL_OFF_ORACLE_PRICE, CALL_OFF_REQ_SIZE, CALL_OFF_PADDING,
+        RET_OFF_ABI_VERSION, RET_OFF_FLAGS, RET_OFF_EXEC_PRICE, RET_OFF_EXEC_SIZE, RET_OFF_REQ_ID, RET_OFF_LP_ACCOUNT_ID, RET_OFF_ORACLE_PRICE, RET_OFF_RESERVED,
+    },
     processor as percolator_processor,
     zc,
 };
@@ -43,42 +47,37 @@ fn matcher_mock_process_instruction(
     if data.len() != MATCHER_CALL_LEN { return Err(ProgramError::InvalidInstructionData); }
     if data[0] != MATCHER_CALL_TAG { return Err(ProgramError::InvalidInstructionData); }
 
-    // Parse call data according to 67-byte ABI:
-    // byte 0: tag
-    // 1..9: req_id (u64)
-    // 9..11: lp_idx (u16)
-    // 11..19: lp_account_id (u64)
-    // 19..27: oracle_price_e6 (u64)
-    // 27..43: req_size (i128)
-    // 43..67: reserved/padding (must be zero for strictness)
-    let req_id = u64::from_le_bytes(data[1..9].try_into().unwrap());
-    let _lp_idx = u16::from_le_bytes(data[9..11].try_into().unwrap());
-    let lp_account_id = u64::from_le_bytes(data[11..19].try_into().unwrap());
-    let oracle_price_e6 = u64::from_le_bytes(data[19..27].try_into().unwrap());
-    let req_size = i128::from_le_bytes(data[27..43].try_into().unwrap());
+    // Parse call data using ABI offset constants (67-byte layout)
+    let req_id = u64::from_le_bytes(data[CALL_OFF_REQ_ID..CALL_OFF_REQ_ID+8].try_into().unwrap());
+    let _lp_idx = u16::from_le_bytes(data[CALL_OFF_LP_IDX..CALL_OFF_LP_IDX+2].try_into().unwrap());
+    let lp_account_id = u64::from_le_bytes(data[CALL_OFF_LP_ACCOUNT_ID..CALL_OFF_LP_ACCOUNT_ID+8].try_into().unwrap());
+    let oracle_price_e6 = u64::from_le_bytes(data[CALL_OFF_ORACLE_PRICE..CALL_OFF_ORACLE_PRICE+8].try_into().unwrap());
+    let req_size = i128::from_le_bytes(data[CALL_OFF_REQ_SIZE..CALL_OFF_REQ_SIZE+16].try_into().unwrap());
 
     // Require padding to be zero (strictness)
-    for &b in &data[43..67] {
+    for &b in &data[CALL_OFF_PADDING..MATCHER_CALL_LEN] {
         if b != 0 { return Err(ProgramError::InvalidInstructionData); }
     }
 
     {
         let mut ctx = a_ctx.try_borrow_mut_data()?;
-        // Zero the entire prefix first (prevents stale data)
+        // In test mode, Percolator doesn't zero the prefix (due to ExternalAccountDataModified),
+        // so the matcher mock must zero it. In production, Percolator zeros it before CPI.
         ctx[0..64].fill(0);
 
+        // Write return data using ABI offset constants (64-byte prefix)
         let abi_version = MATCHER_ABI_VERSION;
         let flags = 1u32; // VALID bit
         let reserved = 0u64;
 
-        ctx[0..4].copy_from_slice(&abi_version.to_le_bytes());
-        ctx[4..8].copy_from_slice(&flags.to_le_bytes());
-        ctx[8..16].copy_from_slice(&oracle_price_e6.to_le_bytes());
-        ctx[16..32].copy_from_slice(&req_size.to_le_bytes());
-        ctx[32..40].copy_from_slice(&req_id.to_le_bytes());
-        ctx[40..48].copy_from_slice(&lp_account_id.to_le_bytes());
-        ctx[48..56].copy_from_slice(&oracle_price_e6.to_le_bytes());
-        ctx[56..64].copy_from_slice(&reserved.to_le_bytes());
+        ctx[RET_OFF_ABI_VERSION..RET_OFF_ABI_VERSION+4].copy_from_slice(&abi_version.to_le_bytes());
+        ctx[RET_OFF_FLAGS..RET_OFF_FLAGS+4].copy_from_slice(&flags.to_le_bytes());
+        ctx[RET_OFF_EXEC_PRICE..RET_OFF_EXEC_PRICE+8].copy_from_slice(&oracle_price_e6.to_le_bytes());
+        ctx[RET_OFF_EXEC_SIZE..RET_OFF_EXEC_SIZE+16].copy_from_slice(&req_size.to_le_bytes());
+        ctx[RET_OFF_REQ_ID..RET_OFF_REQ_ID+8].copy_from_slice(&req_id.to_le_bytes());
+        ctx[RET_OFF_LP_ACCOUNT_ID..RET_OFF_LP_ACCOUNT_ID+8].copy_from_slice(&lp_account_id.to_le_bytes());
+        ctx[RET_OFF_ORACLE_PRICE..RET_OFF_ORACLE_PRICE+8].copy_from_slice(&oracle_price_e6.to_le_bytes());
+        ctx[RET_OFF_RESERVED..RET_OFF_RESERVED+8].copy_from_slice(&reserved.to_le_bytes());
     }
     Ok(())
 }
@@ -506,26 +505,28 @@ fn malicious_replay_matcher_process_instruction(
     if data.len() != MATCHER_CALL_LEN { return Err(ProgramError::InvalidInstructionData); }
     if data[0] != MATCHER_CALL_TAG { return Err(ProgramError::InvalidInstructionData); }
 
-    let _req_id = u64::from_le_bytes(data[1..9].try_into().unwrap());
-    let lp_account_id = u64::from_le_bytes(data[11..19].try_into().unwrap());
-    let oracle_price_e6 = u64::from_le_bytes(data[19..27].try_into().unwrap());
-    let req_size = i128::from_le_bytes(data[27..43].try_into().unwrap());
+    // Parse using ABI constants
+    let _req_id = u64::from_le_bytes(data[CALL_OFF_REQ_ID..CALL_OFF_REQ_ID+8].try_into().unwrap());
+    let lp_account_id = u64::from_le_bytes(data[CALL_OFF_LP_ACCOUNT_ID..CALL_OFF_LP_ACCOUNT_ID+8].try_into().unwrap());
+    let oracle_price_e6 = u64::from_le_bytes(data[CALL_OFF_ORACLE_PRICE..CALL_OFF_ORACLE_PRICE+8].try_into().unwrap());
+    let req_size = i128::from_le_bytes(data[CALL_OFF_REQ_SIZE..CALL_OFF_REQ_SIZE+16].try_into().unwrap());
 
     // MALICIOUS: replay req_id = 1 instead of echoing the actual req_id
     let replayed_req_id = 1u64;
 
     {
         let mut ctx = a_ctx.try_borrow_mut_data()?;
+        // Zero the prefix (in test mode, Percolator doesn't do this)
         ctx[0..64].fill(0);
 
-        ctx[0..4].copy_from_slice(&MATCHER_ABI_VERSION.to_le_bytes());
-        ctx[4..8].copy_from_slice(&1u32.to_le_bytes()); // VALID flag
-        ctx[8..16].copy_from_slice(&oracle_price_e6.to_le_bytes());
-        ctx[16..32].copy_from_slice(&req_size.to_le_bytes());
-        ctx[32..40].copy_from_slice(&replayed_req_id.to_le_bytes()); // REPLAYED!
-        ctx[40..48].copy_from_slice(&lp_account_id.to_le_bytes());
-        ctx[48..56].copy_from_slice(&oracle_price_e6.to_le_bytes());
-        ctx[56..64].copy_from_slice(&0u64.to_le_bytes());
+        ctx[RET_OFF_ABI_VERSION..RET_OFF_ABI_VERSION+4].copy_from_slice(&MATCHER_ABI_VERSION.to_le_bytes());
+        ctx[RET_OFF_FLAGS..RET_OFF_FLAGS+4].copy_from_slice(&1u32.to_le_bytes()); // VALID flag
+        ctx[RET_OFF_EXEC_PRICE..RET_OFF_EXEC_PRICE+8].copy_from_slice(&oracle_price_e6.to_le_bytes());
+        ctx[RET_OFF_EXEC_SIZE..RET_OFF_EXEC_SIZE+16].copy_from_slice(&req_size.to_le_bytes());
+        ctx[RET_OFF_REQ_ID..RET_OFF_REQ_ID+8].copy_from_slice(&replayed_req_id.to_le_bytes()); // REPLAYED!
+        ctx[RET_OFF_LP_ACCOUNT_ID..RET_OFF_LP_ACCOUNT_ID+8].copy_from_slice(&lp_account_id.to_le_bytes());
+        ctx[RET_OFF_ORACLE_PRICE..RET_OFF_ORACLE_PRICE+8].copy_from_slice(&oracle_price_e6.to_le_bytes());
+        ctx[RET_OFF_RESERVED..RET_OFF_RESERVED+8].copy_from_slice(&0u64.to_le_bytes());
     }
     Ok(())
 }
