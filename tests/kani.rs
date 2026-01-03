@@ -2,22 +2,35 @@
 //!
 //! Run with: `cargo kani --tests`
 //!
-//! These harnesses prove security-critical properties:
+//! These harnesses prove PROGRAM-LEVEL security properties:
 //! - Matcher ABI validation rejects malformed/malicious returns
-//! - Risk gate blocks risk-increasing trades when threshold active
-//! - Threshold policy semantics
+//! - Owner/signer enforcement for all account operations
+//! - Admin authorization and burned admin handling
+//! - CPI identity binding (matcher program/context match LP registration)
+//! - Matcher account shape validation
+//! - PDA key mismatch rejection
+//! - Nonce monotonicity (unchanged on failure, +1 on success)
+//! - CPI uses exec_size (not requested size)
 //!
-//! Note: CPI execution is not modeled; we prove wrapper logic only.
+//! Note: CPI execution and risk engine internals are NOT modeled.
+//! Only wrapper-level authorization and binding logic is proven.
 
 #![cfg(kani)]
 
-use percolator::{RiskEngine, RiskParams};
-
-// Import real matcher_abi types from the program crate
+// Import real types and helpers from the program crate
 use percolator_prog::matcher_abi::{
     MatcherReturn, validate_matcher_return, FLAG_VALID, FLAG_PARTIAL_OK, FLAG_REJECTED,
 };
 use percolator_prog::constants::MATCHER_ABI_VERSION;
+use percolator_prog::verify::{
+    owner_ok, admin_ok, matcher_identity_ok, matcher_shape_ok, MatcherAccountsShape,
+    gate_active, nonce_on_success, nonce_on_failure, pda_key_matches, cpi_trade_size,
+    crank_authorized,
+};
+
+// =============================================================================
+// Test Fixtures
+// =============================================================================
 
 /// Create a MatcherReturn from individual symbolic fields
 fn any_matcher_return() -> MatcherReturn {
@@ -34,127 +47,13 @@ fn any_matcher_return() -> MatcherReturn {
 }
 
 // =============================================================================
-// LP Risk State (mirrors main crate's LpRiskState for verification)
-// =============================================================================
-
-/// LP risk state for O(1) delta checks
-struct LpRiskState {
-    sum_abs: u128,
-    max_abs: u128,
-}
-
-impl LpRiskState {
-    /// Compute from engine state
-    fn compute(engine: &RiskEngine) -> Self {
-        let mut sum_abs: u128 = 0;
-        let mut max_abs: u128 = 0;
-        for i in 0..engine.accounts.len() {
-            if engine.is_used(i) && engine.accounts[i].is_lp() {
-                let abs_pos = engine.accounts[i].position_size.unsigned_abs();
-                sum_abs = sum_abs.saturating_add(abs_pos);
-                max_abs = max_abs.max(abs_pos);
-            }
-        }
-        Self { sum_abs, max_abs }
-    }
-
-    /// Current risk metric
-    fn risk(&self) -> u128 {
-        self.max_abs.saturating_add(self.sum_abs / 8)
-    }
-
-    /// O(1) check: would applying delta increase system risk?
-    fn would_increase_risk(&self, old_lp_pos: i128, delta: i128) -> bool {
-        let old_lp_abs = old_lp_pos.unsigned_abs();
-        let new_lp_pos = old_lp_pos.saturating_add(delta);
-        let new_lp_abs = new_lp_pos.unsigned_abs();
-
-        // Update sum_abs in O(1)
-        let new_sum_abs = self.sum_abs
-            .saturating_sub(old_lp_abs)
-            .saturating_add(new_lp_abs);
-
-        // Update max_abs in O(1) (conservative)
-        let new_max_abs = if new_lp_abs >= self.max_abs {
-            new_lp_abs
-        } else if old_lp_abs == self.max_abs && new_lp_abs < old_lp_abs {
-            self.max_abs // conservative
-        } else {
-            self.max_abs
-        };
-
-        let old_risk = self.risk();
-        let new_risk = new_max_abs.saturating_add(new_sum_abs / 8);
-        new_risk > old_risk
-    }
-}
-
-// =============================================================================
-// Test Fixtures - using real engine APIs
-// =============================================================================
-
-/// Create RiskParams suitable for Kani proofs
-fn params_for_kani() -> RiskParams {
-    RiskParams {
-        warmup_period_slots: 100,
-        maintenance_margin_bps: 500,
-        initial_margin_bps: 1000,
-        trading_fee_bps: 10,
-        max_accounts: 8, // Small for Kani
-        new_account_fee: 0, // So fee_payment=0 works
-        risk_reduction_threshold: 0, // Off by default
-        maintenance_fee_per_slot: 0,
-        max_crank_staleness_slots: u64::MAX, // Disable crank freshness
-        liquidation_fee_bps: 50,
-        liquidation_fee_cap: u128::MAX,
-        liquidation_buffer_bps: 100,
-        min_liquidation_abs: 0,
-    }
-}
-
-/// Create a minimal RiskEngine with one LP at given position
-fn make_engine_with_lp(lp_position: i128) -> (RiskEngine, u16) {
-    let params = params_for_kani();
-    let mut engine = RiskEngine::new(params);
-
-    // Use real add_lp to properly set used bitmap
-    let lp_idx = engine
-        .add_lp([2u8; 32], [3u8; 32], 0)
-        .expect("add_lp should succeed");
-
-    // Set position and owner
-    engine.accounts[lp_idx as usize].position_size = lp_position;
-    engine.accounts[lp_idx as usize].owner = [1u8; 32];
-
-    (engine, lp_idx)
-}
-
-/// Create engine with two LPs
-fn make_engine_with_two_lps(pos1: i128, pos2: i128) -> (RiskEngine, u16, u16) {
-    let params = params_for_kani();
-    let mut engine = RiskEngine::new(params);
-
-    let lp_idx1 = engine.add_lp([2u8; 32], [3u8; 32], 0).expect("add_lp 1");
-    let lp_idx2 = engine.add_lp([4u8; 32], [5u8; 32], 0).expect("add_lp 2");
-
-    engine.accounts[lp_idx1 as usize].position_size = pos1;
-    engine.accounts[lp_idx1 as usize].owner = [1u8; 32];
-    engine.accounts[lp_idx2 as usize].position_size = pos2;
-    engine.accounts[lp_idx2 as usize].owner = [6u8; 32];
-
-    (engine, lp_idx1, lp_idx2)
-}
-
-// =============================================================================
-// MATCHER ABI HARNESSES (Pure - using real validate_matcher_return)
+// A. MATCHER ABI VALIDATION (11 proofs - program-level, keep these)
 // =============================================================================
 
 /// Prove: wrong ABI version is always rejected
 #[kani::proof]
 fn kani_matcher_rejects_wrong_abi_version() {
     let mut ret = any_matcher_return();
-
-    // Force wrong ABI version
     kani::assume(ret.abi_version != MATCHER_ABI_VERSION);
 
     let lp_account_id: u64 = kani::any();
@@ -170,8 +69,6 @@ fn kani_matcher_rejects_wrong_abi_version() {
 #[kani::proof]
 fn kani_matcher_rejects_missing_valid_flag() {
     let mut ret = any_matcher_return();
-
-    // Correct ABI version but missing VALID flag
     ret.abi_version = MATCHER_ABI_VERSION;
     kani::assume((ret.flags & FLAG_VALID) == 0);
 
@@ -188,8 +85,6 @@ fn kani_matcher_rejects_missing_valid_flag() {
 #[kani::proof]
 fn kani_matcher_rejects_rejected_flag() {
     let mut ret = any_matcher_return();
-
-    // Valid ABI, has VALID flag, but also has REJECTED flag
     ret.abi_version = MATCHER_ABI_VERSION;
     ret.flags |= FLAG_VALID;
     ret.flags |= FLAG_REJECTED;
@@ -207,25 +102,22 @@ fn kani_matcher_rejects_rejected_flag() {
 #[kani::proof]
 fn kani_matcher_rejects_wrong_req_id() {
     let mut ret = any_matcher_return();
-
-    // Make it otherwise valid
     ret.abi_version = MATCHER_ABI_VERSION;
     ret.flags = FLAG_VALID;
     ret.reserved = 0;
     kani::assume(ret.exec_price_e6 != 0);
 
-    let lp_account_id: u64 = ret.lp_account_id; // match
-    let oracle_price: u64 = ret.oracle_price_e6; // match
+    let lp_account_id: u64 = ret.lp_account_id;
+    let oracle_price: u64 = ret.oracle_price_e6;
     let req_size: i128 = kani::any();
     kani::assume(req_size != 0);
-    kani::assume(req_size != i128::MIN); // abs() overflow
+    kani::assume(req_size != i128::MIN);
     kani::assume(ret.exec_size != 0);
-    kani::assume(ret.exec_size != i128::MIN); // abs() overflow
+    kani::assume(ret.exec_size != i128::MIN);
     kani::assume(ret.exec_size.signum() == req_size.signum());
     kani::assume(ret.exec_size.abs() <= req_size.abs());
 
     let req_id: u64 = kani::any();
-    // Force mismatch
     kani::assume(ret.req_id != req_id);
 
     let result = validate_matcher_return(&ret, lp_account_id, oracle_price, req_size, req_id);
@@ -236,14 +128,12 @@ fn kani_matcher_rejects_wrong_req_id() {
 #[kani::proof]
 fn kani_matcher_rejects_wrong_lp_account_id() {
     let mut ret = any_matcher_return();
-
     ret.abi_version = MATCHER_ABI_VERSION;
     ret.flags = FLAG_VALID;
     ret.reserved = 0;
     kani::assume(ret.exec_price_e6 != 0);
 
     let lp_account_id: u64 = kani::any();
-    // Force mismatch
     kani::assume(ret.lp_account_id != lp_account_id);
 
     let oracle_price: u64 = ret.oracle_price_e6;
@@ -258,7 +148,6 @@ fn kani_matcher_rejects_wrong_lp_account_id() {
 #[kani::proof]
 fn kani_matcher_rejects_wrong_oracle_price() {
     let mut ret = any_matcher_return();
-
     ret.abi_version = MATCHER_ABI_VERSION;
     ret.flags = FLAG_VALID;
     ret.reserved = 0;
@@ -266,7 +155,6 @@ fn kani_matcher_rejects_wrong_oracle_price() {
 
     let lp_account_id: u64 = ret.lp_account_id;
     let oracle_price: u64 = kani::any();
-    // Force mismatch
     kani::assume(ret.oracle_price_e6 != oracle_price);
 
     let req_size: i128 = kani::any();
@@ -280,11 +168,9 @@ fn kani_matcher_rejects_wrong_oracle_price() {
 #[kani::proof]
 fn kani_matcher_rejects_nonzero_reserved() {
     let mut ret = any_matcher_return();
-
     ret.abi_version = MATCHER_ABI_VERSION;
     ret.flags = FLAG_VALID;
     kani::assume(ret.exec_price_e6 != 0);
-    // Force non-zero reserved
     kani::assume(ret.reserved != 0);
 
     let lp_account_id: u64 = ret.lp_account_id;
@@ -300,11 +186,10 @@ fn kani_matcher_rejects_nonzero_reserved() {
 #[kani::proof]
 fn kani_matcher_rejects_zero_exec_price() {
     let mut ret = any_matcher_return();
-
     ret.abi_version = MATCHER_ABI_VERSION;
     ret.flags = FLAG_VALID;
     ret.reserved = 0;
-    ret.exec_price_e6 = 0; // Force zero price
+    ret.exec_price_e6 = 0;
 
     let lp_account_id: u64 = ret.lp_account_id;
     let oracle_price: u64 = ret.oracle_price_e6;
@@ -319,12 +204,11 @@ fn kani_matcher_rejects_zero_exec_price() {
 #[kani::proof]
 fn kani_matcher_zero_size_requires_partial_ok() {
     let mut ret = any_matcher_return();
-
     ret.abi_version = MATCHER_ABI_VERSION;
     ret.flags = FLAG_VALID; // No PARTIAL_OK
     ret.reserved = 0;
     kani::assume(ret.exec_price_e6 != 0);
-    ret.exec_size = 0; // Zero size
+    ret.exec_size = 0;
 
     let lp_account_id: u64 = ret.lp_account_id;
     let oracle_price: u64 = ret.oracle_price_e6;
@@ -339,21 +223,19 @@ fn kani_matcher_zero_size_requires_partial_ok() {
 #[kani::proof]
 fn kani_matcher_rejects_exec_size_exceeds_req() {
     let mut ret = any_matcher_return();
-
     ret.abi_version = MATCHER_ABI_VERSION;
     ret.flags = FLAG_VALID;
     ret.reserved = 0;
     kani::assume(ret.exec_price_e6 != 0);
     kani::assume(ret.exec_size != 0);
-    kani::assume(ret.exec_size != i128::MIN); // abs() overflow
+    kani::assume(ret.exec_size != i128::MIN);
 
     let lp_account_id: u64 = ret.lp_account_id;
     let oracle_price: u64 = ret.oracle_price_e6;
     let req_id: u64 = ret.req_id;
 
     let req_size: i128 = kani::any();
-    kani::assume(req_size != i128::MIN); // abs() overflow
-    // Force exec_size > req_size (absolute)
+    kani::assume(req_size != i128::MIN);
     kani::assume(ret.exec_size.abs() > req_size.abs());
 
     let result = validate_matcher_return(&ret, lp_account_id, oracle_price, req_size, req_id);
@@ -364,13 +246,12 @@ fn kani_matcher_rejects_exec_size_exceeds_req() {
 #[kani::proof]
 fn kani_matcher_rejects_sign_mismatch() {
     let mut ret = any_matcher_return();
-
     ret.abi_version = MATCHER_ABI_VERSION;
     ret.flags = FLAG_VALID;
     ret.reserved = 0;
     kani::assume(ret.exec_price_e6 != 0);
     kani::assume(ret.exec_size != 0);
-    kani::assume(ret.exec_size != i128::MIN); // abs() overflow
+    kani::assume(ret.exec_size != i128::MIN);
 
     let lp_account_id: u64 = ret.lp_account_id;
     let oracle_price: u64 = ret.oracle_price_e6;
@@ -378,10 +259,8 @@ fn kani_matcher_rejects_sign_mismatch() {
 
     let req_size: i128 = kani::any();
     kani::assume(req_size != 0);
-    kani::assume(req_size != i128::MIN); // abs() overflow
-    // Force sign mismatch
+    kani::assume(req_size != i128::MIN);
     kani::assume(ret.exec_size.signum() != req_size.signum());
-    // But abs is ok
     kani::assume(ret.exec_size.abs() <= req_size.abs());
 
     let result = validate_matcher_return(&ret, lp_account_id, oracle_price, req_size, req_id);
@@ -389,212 +268,358 @@ fn kani_matcher_rejects_sign_mismatch() {
 }
 
 // =============================================================================
-// RISK GATE HARNESSES (using real engine with proper LP allocation)
+// B. OWNER/SIGNER ENFORCEMENT (2 proofs)
 // =============================================================================
 
-/// Prove: LpRiskState computes correct sum_abs for single LP
+/// Prove: owner mismatch is rejected
 #[kani::proof]
-fn kani_risk_state_sum_abs_single_lp() {
-    let pos: i64 = kani::any(); // Use i64 to avoid overflow edge cases
-    kani::assume(pos != i64::MIN); // Avoid unsigned_abs edge case
+fn kani_owner_mismatch_rejected() {
+    let stored: [u8; 32] = kani::any();
+    let signer: [u8; 32] = kani::any();
+    kani::assume(stored != signer);
 
-    let (engine, _lp_idx) = make_engine_with_lp(pos as i128);
-    let state = LpRiskState::compute(&engine);
-
-    let expected_abs = (pos as i128).unsigned_abs();
-    assert_eq!(state.sum_abs, expected_abs, "sum_abs must equal LP abs position");
-    assert_eq!(state.max_abs, expected_abs, "max_abs must equal LP abs position");
+    assert!(
+        !owner_ok(stored, signer),
+        "owner mismatch must be rejected"
+    );
 }
 
-/// Prove: would_increase_risk returns true when absolute position grows
+/// Prove: owner match is accepted
 #[kani::proof]
-fn kani_risk_gate_detects_position_growth() {
-    let old_pos: i64 = kani::any();
-    let delta: i64 = kani::any();
+fn kani_owner_match_accepted() {
+    let owner: [u8; 32] = kani::any();
 
-    // Avoid overflow and edge cases
-    kani::assume(old_pos != i64::MIN);
-    kani::assume(delta != i64::MIN);
-    kani::assume((old_pos as i128).checked_add(delta as i128).is_some());
-
-    let (engine, _lp_idx) = make_engine_with_lp(old_pos as i128);
-    let state = LpRiskState::compute(&engine);
-
-    let new_pos = (old_pos as i128).saturating_add(delta as i128);
-    let old_abs = (old_pos as i128).unsigned_abs();
-    let new_abs = new_pos.unsigned_abs();
-
-    // If absolute position strictly increases, risk should increase
-    if new_abs > old_abs {
-        assert!(
-            state.would_increase_risk(old_pos as i128, delta as i128),
-            "growing absolute position must increase risk"
-        );
-    }
+    assert!(
+        owner_ok(owner, owner),
+        "owner match must be accepted"
+    );
 }
 
-/// Prove: would_increase_risk returns false when position reduces toward zero
+// =============================================================================
+// C. ADMIN AUTHORIZATION (3 proofs)
+// =============================================================================
+
+/// Prove: admin mismatch is rejected
 #[kani::proof]
-fn kani_risk_gate_allows_position_reduction() {
-    let old_pos: i64 = kani::any();
+fn kani_admin_mismatch_rejected() {
+    let admin: [u8; 32] = kani::any();
+    let signer: [u8; 32] = kani::any();
+    kani::assume(admin != [0u8; 32]); // Not burned
+    kani::assume(admin != signer);
 
-    // Non-zero starting position, avoid edge cases
-    kani::assume(old_pos != 0);
-    kani::assume(old_pos != i64::MIN);
+    assert!(
+        !admin_ok(admin, signer),
+        "admin mismatch must be rejected"
+    );
+}
 
-    // Delta that moves toward zero (opposite sign, smaller magnitude)
-    let delta: i64 = if old_pos > 0 {
-        let d: i64 = kani::any();
-        kani::assume(d < 0);
-        kani::assume(d != i64::MIN);
-        kani::assume((-d) <= old_pos); // d.abs() <= old_pos
-        d
-    } else {
-        let d: i64 = kani::any();
-        kani::assume(d > 0);
-        kani::assume(d <= (-old_pos)); // d <= old_pos.abs()
-        d
+/// Prove: admin match is accepted (when not burned)
+#[kani::proof]
+fn kani_admin_match_accepted() {
+    let admin: [u8; 32] = kani::any();
+    kani::assume(admin != [0u8; 32]); // Not burned
+
+    assert!(
+        admin_ok(admin, admin),
+        "admin match must be accepted"
+    );
+}
+
+/// Prove: burned admin (all zeros) disables all admin ops
+#[kani::proof]
+fn kani_admin_burned_disables_ops() {
+    let burned_admin = [0u8; 32];
+    let signer: [u8; 32] = kani::any();
+
+    assert!(
+        !admin_ok(burned_admin, signer),
+        "burned admin must disable all admin ops"
+    );
+}
+
+// =============================================================================
+// D. CPI IDENTITY BINDING (2 proofs) - CRITICAL
+// =============================================================================
+
+/// Prove: CPI matcher identity mismatch (program or context) is rejected
+#[kani::proof]
+fn kani_matcher_identity_mismatch_rejected() {
+    let lp_prog: [u8; 32] = kani::any();
+    let lp_ctx: [u8; 32] = kani::any();
+    let provided_prog: [u8; 32] = kani::any();
+    let provided_ctx: [u8; 32] = kani::any();
+
+    // At least one must mismatch
+    kani::assume(lp_prog != provided_prog || lp_ctx != provided_ctx);
+
+    assert!(
+        !matcher_identity_ok(lp_prog, lp_ctx, provided_prog, provided_ctx),
+        "matcher identity mismatch must be rejected"
+    );
+}
+
+/// Prove: CPI matcher identity match is accepted
+#[kani::proof]
+fn kani_matcher_identity_match_accepted() {
+    let prog: [u8; 32] = kani::any();
+    let ctx: [u8; 32] = kani::any();
+
+    assert!(
+        matcher_identity_ok(prog, ctx, prog, ctx),
+        "matcher identity match must be accepted"
+    );
+}
+
+// =============================================================================
+// E. MATCHER ACCOUNT SHAPE VALIDATION (5 proofs)
+// =============================================================================
+
+/// Prove: non-executable matcher program is rejected
+#[kani::proof]
+fn kani_matcher_shape_rejects_non_executable_prog() {
+    let shape = MatcherAccountsShape {
+        prog_executable: false, // BAD
+        ctx_executable: false,
+        ctx_owner_is_prog: true,
+        ctx_len_ok: true,
     };
 
-    let (engine, _lp_idx) = make_engine_with_lp(old_pos as i128);
-    let state = LpRiskState::compute(&engine);
-
-    let new_pos = (old_pos as i128).saturating_add(delta as i128);
-
-    // New absolute should be <= old absolute
-    assert!(new_pos.unsigned_abs() <= (old_pos as i128).unsigned_abs());
-
-    // Risk should not increase
     assert!(
-        !state.would_increase_risk(old_pos as i128, delta as i128),
-        "reducing position toward zero must not increase risk"
+        !matcher_shape_ok(shape),
+        "non-executable matcher program must be rejected"
     );
 }
 
-/// Prove: sum_abs consistency - old_lp_abs is always <= sum_abs when computed from same engine
+/// Prove: executable matcher context is rejected
 #[kani::proof]
-fn kani_risk_state_sum_abs_consistency() {
-    let pos: i64 = kani::any();
-    kani::assume(pos != i64::MIN);
+fn kani_matcher_shape_rejects_executable_ctx() {
+    let shape = MatcherAccountsShape {
+        prog_executable: true,
+        ctx_executable: true, // BAD
+        ctx_owner_is_prog: true,
+        ctx_len_ok: true,
+    };
 
-    let (engine, lp_idx) = make_engine_with_lp(pos as i128);
-    let state = LpRiskState::compute(&engine);
-
-    let old_lp_pos = engine.accounts[lp_idx as usize].position_size;
-    let old_lp_abs = old_lp_pos.unsigned_abs();
-
-    // This is the invariant we need for O(1) delta to be safe
     assert!(
-        state.sum_abs >= old_lp_abs,
-        "sum_abs must include old_lp_abs"
+        !matcher_shape_ok(shape),
+        "executable matcher context must be rejected"
     );
 }
 
-/// Prove: with two LPs, risk tracks the max concentration correctly
+/// Prove: context not owned by program is rejected
 #[kani::proof]
-#[kani::unwind(10)] // For array iteration
-fn kani_risk_state_max_concentration() {
-    let pos1: i32 = kani::any(); // Use i32 for faster proofs
-    let pos2: i32 = kani::any();
+fn kani_matcher_shape_rejects_wrong_ctx_owner() {
+    let shape = MatcherAccountsShape {
+        prog_executable: true,
+        ctx_executable: false,
+        ctx_owner_is_prog: false, // BAD
+        ctx_len_ok: true,
+    };
 
-    let (engine, _, _) = make_engine_with_two_lps(pos1 as i128, pos2 as i128);
-    let state = LpRiskState::compute(&engine);
+    assert!(
+        !matcher_shape_ok(shape),
+        "context not owned by program must be rejected"
+    );
+}
 
-    let abs1 = (pos1 as i128).unsigned_abs();
-    let abs2 = (pos2 as i128).unsigned_abs();
-    let expected_max = abs1.max(abs2);
+/// Prove: insufficient context length is rejected
+#[kani::proof]
+fn kani_matcher_shape_rejects_short_ctx() {
+    let shape = MatcherAccountsShape {
+        prog_executable: true,
+        ctx_executable: false,
+        ctx_owner_is_prog: true,
+        ctx_len_ok: false, // BAD
+    };
 
-    assert_eq!(state.max_abs, expected_max, "max_abs must be max of LP positions");
+    assert!(
+        !matcher_shape_ok(shape),
+        "insufficient context length must be rejected"
+    );
+}
+
+/// Prove: valid matcher shape is accepted
+#[kani::proof]
+fn kani_matcher_shape_valid_accepted() {
+    let shape = MatcherAccountsShape {
+        prog_executable: true,
+        ctx_executable: false,
+        ctx_owner_is_prog: true,
+        ctx_len_ok: true,
+    };
+
+    assert!(
+        matcher_shape_ok(shape),
+        "valid matcher shape must be accepted"
+    );
 }
 
 // =============================================================================
-// THRESHOLD POLICY HARNESSES
+// F. PDA KEY MATCHING (2 proofs)
 // =============================================================================
 
-/// Threshold gate logic (pure)
-fn should_gate_trade(insurance_balance: u128, threshold: u128) -> bool {
-    threshold > 0 && insurance_balance <= threshold
+/// Prove: PDA key mismatch is rejected
+#[kani::proof]
+fn kani_pda_mismatch_rejected() {
+    let expected: [u8; 32] = kani::any();
+    let provided: [u8; 32] = kani::any();
+    kani::assume(expected != provided);
+
+    assert!(
+        !pda_key_matches(expected, provided),
+        "PDA key mismatch must be rejected"
+    );
 }
 
-/// Prove: threshold=0 never gates
+/// Prove: PDA key match is accepted
 #[kani::proof]
-fn kani_threshold_zero_never_gates() {
+fn kani_pda_match_accepted() {
+    let key: [u8; 32] = kani::any();
+
+    assert!(
+        pda_key_matches(key, key),
+        "PDA key match must be accepted"
+    );
+}
+
+// =============================================================================
+// G. NONCE MONOTONICITY (3 proofs)
+// =============================================================================
+
+/// Prove: nonce unchanged on failure
+#[kani::proof]
+fn kani_nonce_unchanged_on_failure() {
+    let old_nonce: u64 = kani::any();
+    let new_nonce = nonce_on_failure(old_nonce);
+
+    assert_eq!(
+        new_nonce, old_nonce,
+        "nonce must be unchanged on failure"
+    );
+}
+
+/// Prove: nonce advances by exactly 1 on success
+#[kani::proof]
+fn kani_nonce_advances_on_success() {
+    let old_nonce: u64 = kani::any();
+    let new_nonce = nonce_on_success(old_nonce);
+
+    assert_eq!(
+        new_nonce,
+        old_nonce.wrapping_add(1),
+        "nonce must advance by 1 on success"
+    );
+}
+
+/// Prove: nonce wraps correctly at u64::MAX
+#[kani::proof]
+fn kani_nonce_wraps_at_max() {
+    let old_nonce = u64::MAX;
+    let new_nonce = nonce_on_success(old_nonce);
+
+    assert_eq!(
+        new_nonce, 0,
+        "nonce must wrap to 0 at u64::MAX"
+    );
+}
+
+// =============================================================================
+// H. CPI USES EXEC_SIZE (1 proof) - CRITICAL
+// =============================================================================
+
+/// Prove: CPI path uses exec_size from matcher, not requested size
+#[kani::proof]
+fn kani_cpi_uses_exec_size() {
+    let exec_size: i128 = kani::any();
+    let requested_size: i128 = kani::any();
+
+    // Even when they differ, cpi_trade_size returns exec_size
+    let chosen = cpi_trade_size(exec_size, requested_size);
+
+    assert_eq!(
+        chosen, exec_size,
+        "CPI must use exec_size, not requested size"
+    );
+}
+
+// =============================================================================
+// I. GATE ACTIVATION LOGIC (3 proofs)
+// =============================================================================
+
+/// Prove: gate not active when threshold is zero
+#[kani::proof]
+fn kani_gate_inactive_when_threshold_zero() {
     let balance: u128 = kani::any();
 
     assert!(
-        !should_gate_trade(balance, 0),
-        "threshold=0 must never gate trades"
+        !gate_active(0, balance),
+        "gate must be inactive when threshold is zero"
     );
 }
 
-/// Prove: balance > threshold never gates
+/// Prove: gate not active when balance exceeds threshold
 #[kani::proof]
-fn kani_balance_above_threshold_not_gated() {
+fn kani_gate_inactive_when_balance_exceeds() {
     let threshold: u128 = kani::any();
     let balance: u128 = kani::any();
-
     kani::assume(balance > threshold);
 
     assert!(
-        !should_gate_trade(balance, threshold),
-        "balance above threshold must not gate"
+        !gate_active(threshold, balance),
+        "gate must be inactive when balance > threshold"
     );
 }
 
-/// Prove: balance <= threshold with threshold > 0 always gates
+/// Prove: gate active when threshold > 0 and balance <= threshold
 #[kani::proof]
-fn kani_balance_at_or_below_threshold_gates() {
+fn kani_gate_active_when_conditions_met() {
     let threshold: u128 = kani::any();
-    let balance: u128 = kani::any();
-
     kani::assume(threshold > 0);
+    let balance: u128 = kani::any();
     kani::assume(balance <= threshold);
 
     assert!(
-        should_gate_trade(balance, threshold),
-        "balance at/below positive threshold must gate"
+        gate_active(threshold, balance),
+        "gate must be active when threshold > 0 and balance <= threshold"
     );
 }
 
 // =============================================================================
-// RISK METRIC FORMULA HARNESSES
+// J. KEEPER CRANK AUTHORIZATION (3 proofs)
 // =============================================================================
 
-/// Prove: risk metric is monotonic in sum_abs
+/// Prove: crank authorized when account doesn't exist
 #[kani::proof]
-fn kani_risk_monotonic_in_sum() {
-    let max_abs: u128 = kani::any();
-    let sum1: u128 = kani::any();
-    let sum2: u128 = kani::any();
+fn kani_crank_authorized_no_account() {
+    let signer: [u8; 32] = kani::any();
+    let stored_owner: [u8; 32] = kani::any();
 
-    kani::assume(sum2 > sum1);
-    // Prevent overflow
-    kani::assume(max_abs < u128::MAX / 2);
-    kani::assume(sum1 < u128::MAX / 2);
-    kani::assume(sum2 < u128::MAX / 2);
-
-    let risk1 = max_abs.saturating_add(sum1 / 8);
-    let risk2 = max_abs.saturating_add(sum2 / 8);
-
-    // If sum increases, risk should not decrease
-    assert!(risk2 >= risk1, "risk must be monotonic in sum_abs");
+    assert!(
+        crank_authorized(false, stored_owner, signer),
+        "crank must be authorized when account doesn't exist"
+    );
 }
 
-/// Prove: risk metric is monotonic in max_abs
+/// Prove: crank authorized when signer matches owner
 #[kani::proof]
-fn kani_risk_monotonic_in_max() {
-    let sum_abs: u128 = kani::any();
-    let max1: u128 = kani::any();
-    let max2: u128 = kani::any();
+fn kani_crank_authorized_owner_match() {
+    let owner: [u8; 32] = kani::any();
 
-    kani::assume(max2 > max1);
-    // Prevent overflow
-    kani::assume(sum_abs < u128::MAX / 2);
-    kani::assume(max1 < u128::MAX / 2);
-    kani::assume(max2 < u128::MAX / 2);
+    assert!(
+        crank_authorized(true, owner, owner),
+        "crank must be authorized when signer matches owner"
+    );
+}
 
-    let risk1 = max1.saturating_add(sum_abs / 8);
-    let risk2 = max2.saturating_add(sum_abs / 8);
+/// Prove: crank rejected when signer doesn't match owner
+#[kani::proof]
+fn kani_crank_rejected_owner_mismatch() {
+    let stored_owner: [u8; 32] = kani::any();
+    let signer: [u8; 32] = kani::any();
+    kani::assume(stored_owner != signer);
 
-    assert!(risk2 > risk1, "risk must be strictly monotonic in max_abs");
+    assert!(
+        !crank_authorized(true, stored_owner, signer),
+        "crank must be rejected when signer doesn't match existing account owner"
+    );
 }

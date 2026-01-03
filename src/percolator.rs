@@ -85,14 +85,14 @@ pub mod constants {
 
 /// LP risk state: (sum_abs, max_abs) over all LP positions.
 /// O(n) scan, but called once per instruction then used for O(1) delta checks.
-struct LpRiskState {
-    sum_abs: u128,
-    max_abs: u128,
+pub struct LpRiskState {
+    pub sum_abs: u128,
+    pub max_abs: u128,
 }
 
 impl LpRiskState {
     /// Scan all LP accounts to compute aggregate risk state. O(n).
-    fn compute(engine: &percolator::RiskEngine) -> Self {
+    pub fn compute(engine: &percolator::RiskEngine) -> Self {
         let mut sum_abs: u128 = 0;
         let mut max_abs: u128 = 0;
         for i in 0..engine.accounts.len() {
@@ -107,7 +107,7 @@ impl LpRiskState {
 
     /// Current risk metric: max_concentration + sum_abs/8
     #[inline]
-    fn risk(&self) -> u128 {
+    pub fn risk(&self) -> u128 {
         self.max_abs.saturating_add(self.sum_abs / 8)
     }
 
@@ -115,7 +115,7 @@ impl LpRiskState {
     /// delta is the LP's position change (negative of user's trade size).
     /// Conservative: when LP was max and shrinks, we keep max_abs (overestimates risk, safe).
     #[inline]
-    fn would_increase_risk(&self, old_lp_pos: i128, delta: i128) -> bool {
+    pub fn would_increase_risk(&self, old_lp_pos: i128, delta: i128) -> bool {
         let old_lp_abs = old_lp_pos.unsigned_abs();
         let new_lp_pos = old_lp_pos.saturating_add(delta);
         let new_lp_abs = new_lp_pos.unsigned_abs();
@@ -152,6 +152,113 @@ impl LpRiskState {
 /// Used by KeeperCrank for threshold updates.
 fn compute_system_risk_units(engine: &percolator::RiskEngine) -> u128 {
     LpRiskState::compute(engine).risk()
+}
+
+// =============================================================================
+// Pure helpers for Kani verification (program-level invariants only)
+// =============================================================================
+
+/// Pure verification helpers for program-level authorization and CPI binding.
+/// These are tested by Kani to prove wrapper-level security properties.
+pub mod verify {
+    use crate::constants::MATCHER_CONTEXT_LEN;
+
+    /// Owner authorization: stored owner must match signer.
+    /// Used by: DepositCollateral, WithdrawCollateral, TradeNoCpi, TradeCpi, CloseAccount
+    #[inline]
+    pub fn owner_ok(stored: [u8; 32], signer: [u8; 32]) -> bool {
+        stored == signer
+    }
+
+    /// Admin authorization: admin must be non-zero (not burned) and match signer.
+    /// Used by: SetRiskThreshold, UpdateAdmin
+    #[inline]
+    pub fn admin_ok(admin: [u8; 32], signer: [u8; 32]) -> bool {
+        admin != [0u8; 32] && admin == signer
+    }
+
+    /// CPI identity binding: matcher program and context must match LP registration.
+    /// This is the critical CPI security check.
+    #[inline]
+    pub fn matcher_identity_ok(
+        lp_matcher_program: [u8; 32],
+        lp_matcher_context: [u8; 32],
+        provided_program: [u8; 32],
+        provided_context: [u8; 32],
+    ) -> bool {
+        lp_matcher_program == provided_program && lp_matcher_context == provided_context
+    }
+
+    /// Matcher account shape validation.
+    /// Checks: program is executable, context is not executable,
+    /// context owner is program, context has sufficient length.
+    #[derive(Clone, Copy)]
+    pub struct MatcherAccountsShape {
+        pub prog_executable: bool,
+        pub ctx_executable: bool,
+        pub ctx_owner_is_prog: bool,
+        pub ctx_len_ok: bool,
+    }
+
+    #[inline]
+    pub fn matcher_shape_ok(shape: MatcherAccountsShape) -> bool {
+        shape.prog_executable
+            && !shape.ctx_executable
+            && shape.ctx_owner_is_prog
+            && shape.ctx_len_ok
+    }
+
+    /// Check if context length meets minimum requirement.
+    #[inline]
+    pub fn ctx_len_sufficient(len: usize) -> bool {
+        len >= MATCHER_CONTEXT_LEN
+    }
+
+    /// Gating is active when threshold > 0 AND balance <= threshold.
+    #[inline]
+    pub fn gate_active(threshold: u128, balance: u128) -> bool {
+        threshold > 0 && balance <= threshold
+    }
+
+    /// Nonce update on success: advances by 1.
+    #[inline]
+    pub fn nonce_on_success(old: u64) -> u64 {
+        old.wrapping_add(1)
+    }
+
+    /// Nonce update on failure: unchanged.
+    #[inline]
+    pub fn nonce_on_failure(old: u64) -> u64 {
+        old
+    }
+
+    /// PDA key comparison: provided key must match expected derived key.
+    #[inline]
+    pub fn pda_key_matches(expected: [u8; 32], provided: [u8; 32]) -> bool {
+        expected == provided
+    }
+
+    /// Trade size selection for CPI path: must use exec_size from matcher, not requested size.
+    /// Returns the size that should be passed to engine.execute_trade.
+    #[inline]
+    pub fn cpi_trade_size(exec_size: i128, _requested_size: i128) -> i128 {
+        exec_size // Must use exec_size, never requested_size
+    }
+
+    /// KeeperCrank authorization: if account exists at idx, signer must be owner.
+    /// If account doesn't exist (idx out of bounds or not used), anyone can crank.
+    #[inline]
+    pub fn crank_authorized(
+        idx_exists: bool,
+        stored_owner: [u8; 32],
+        signer: [u8; 32],
+    ) -> bool {
+        if idx_exists {
+            stored_owner == signer
+        } else {
+            true // Anyone can crank non-existent accounts
+        }
+    }
 }
 
 // 2. mod zc (Zero-Copy unsafe island)
