@@ -91,11 +91,11 @@ struct LpRiskState {
 }
 
 impl LpRiskState {
-    /// Scan all LP accounts to compute aggregate risk state. O(MAX_ACCOUNTS).
+    /// Scan all LP accounts to compute aggregate risk state. O(n).
     fn compute(engine: &percolator::RiskEngine) -> Self {
         let mut sum_abs: u128 = 0;
         let mut max_abs: u128 = 0;
-        for i in 0..percolator::MAX_ACCOUNTS {
+        for i in 0..engine.accounts.len() {
             if engine.is_used(i) && engine.accounts[i].is_lp() {
                 let abs_pos = engine.accounts[i].position_size.unsigned_abs();
                 sum_abs = sum_abs.saturating_add(abs_pos);
@@ -119,6 +119,10 @@ impl LpRiskState {
         let old_lp_abs = old_lp_pos.unsigned_abs();
         let new_lp_pos = old_lp_pos.saturating_add(delta);
         let new_lp_abs = new_lp_pos.unsigned_abs();
+
+        // Guard: old_lp_abs must be part of sum_abs (caller must use same engine snapshot)
+        #[cfg(debug_assertions)]
+        debug_assert!(self.sum_abs >= old_lp_abs, "old_lp_abs not in sum_abs - wrong engine snapshot?");
 
         // Update sum_abs in O(1)
         let new_sum_abs = self.sum_abs
@@ -1289,12 +1293,13 @@ pub mod processor {
                 let clock = Clock::from_account_info(&accounts[3])?;
                 let price = oracle::read_pyth_price_e6(&accounts[4], clock.slot, config.max_staleness_slots, config.conf_filter_bps)?;
 
-                // Gate: if insurance_fund < threshold, only allow risk-reducing trades
+                // Gate: if insurance_fund <= threshold, only allow risk-reducing trades
                 // LP delta is -size (LP takes opposite side of user's trade)
                 // O(1) check after single O(n) scan
+                // Note: thr > 0 check ensures threshold=0 means "no gating"
                 let bal = engine.insurance_fund.balance;
                 let thr = engine.risk_reduction_threshold();
-                if bal < thr {
+                if thr > 0 && bal <= thr {
                     let risk_state = crate::LpRiskState::compute(engine);
                     let old_lp_pos = engine.accounts[lp_idx as usize].position_size;
                     if risk_state.would_increase_risk(old_lp_pos, -size) {
@@ -1440,12 +1445,13 @@ pub mod processor {
                     let mut data = state::slab_data_mut(a_slab)?;
                     let engine = zc::engine_mut(&mut data)?;
 
-                    // Gate: if insurance_fund < threshold, only allow risk-reducing trades
+                    // Gate: if insurance_fund <= threshold, only allow risk-reducing trades
                     // Use actual exec_size from matcher (LP delta is -exec_size)
                     // O(1) check after single O(n) scan
+                    // Note: thr > 0 check ensures threshold=0 means "no gating"
                     let bal = engine.insurance_fund.balance;
                     let thr = engine.risk_reduction_threshold();
-                    if bal < thr {
+                    if thr > 0 && bal <= thr {
                         let risk_state = crate::LpRiskState::compute(engine);
                         let old_lp_pos = engine.accounts[lp_idx as usize].position_size;
                         if risk_state.would_increase_risk(old_lp_pos, -ret.exec_size) {
