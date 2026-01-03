@@ -306,6 +306,7 @@ pub mod ix {
         TopUpInsurance { amount: u64 },
         TradeCpi { lp_idx: u16, user_idx: u16, size: i128 },
         SetRiskThreshold { new_threshold: u128 },
+        UpdateAdmin { new_admin: Pubkey },
     }
 
     impl Instruction {
@@ -379,6 +380,10 @@ pub mod ix {
                 11 => { // SetRiskThreshold
                     let new_threshold = read_u128(&mut rest)?;
                     Ok(Instruction::SetRiskThreshold { new_threshold })
+                },
+                12 => { // UpdateAdmin
+                    let new_admin = read_pubkey(&mut rest)?;
+                    Ok(Instruction::UpdateAdmin { new_admin })
                 },
                 _ => Err(ProgramError::InvalidInstructionData),
             }
@@ -778,6 +783,19 @@ pub mod processor {
         Ok(())
     }
 
+    /// Require that the signer is the current admin.
+    /// If admin is burned (all zeros), admin operations are permanently disabled.
+    fn require_admin(header_admin: [u8; 32], signer: &Pubkey) -> Result<(), ProgramError> {
+        if header_admin == [0u8; 32] {
+            // admin burned/finalized: nobody can do admin ops
+            return Err(PercolatorError::EngineUnauthorized.into());
+        }
+        if header_admin != signer.to_bytes() {
+            return Err(PercolatorError::EngineUnauthorized.into());
+        }
+        Ok(())
+    }
+
     fn check_idx(engine: &RiskEngine, idx: u16) -> Result<(), ProgramError> {
         if (idx as usize) >= MAX_ACCOUNTS || !engine.is_used(idx as usize) {
             return Err(PercolatorError::EngineAccountNotFound.into());
@@ -854,9 +872,9 @@ pub mod processor {
         let instruction = Instruction::decode(instruction_data)?;
 
         match instruction {
-            Instruction::InitMarket { 
-                admin: _admin, collateral_mint: _collateral_mint, pyth_index, pyth_collateral, 
-                max_staleness_slots, conf_filter_bps, risk_params 
+            Instruction::InitMarket {
+                admin, collateral_mint: _collateral_mint, pyth_index, pyth_collateral,
+                max_staleness_slots, conf_filter_bps, risk_params
             } => {
                 accounts::expect_len(accounts, 11)?;
                 let a_admin = &accounts[0];
@@ -866,7 +884,12 @@ pub mod processor {
 
                 accounts::expect_signer(a_admin)?;
                 accounts::expect_writable(a_slab)?;
-                
+
+                // Ensure instruction data matches the signer
+                if admin != *a_admin.key {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+
                 #[cfg(debug_assertions)]
                 {
                     if core::mem::size_of::<MarketConfig>() != CONFIG_LEN {
@@ -1365,12 +1388,29 @@ pub mod processor {
                 require_initialized(&data)?;
 
                 let header = state::read_header(&data);
-                if header.admin != a_admin.key.to_bytes() {
-                    return Err(PercolatorError::EngineUnauthorized.into());
-                }
+                require_admin(header.admin, a_admin.key)?;
 
                 let engine = zc::engine_mut(&mut data)?;
                 engine.set_risk_reduction_threshold(new_threshold);
+            }
+
+            Instruction::UpdateAdmin { new_admin } => {
+                accounts::expect_len(accounts, 2)?;
+                let a_admin = &accounts[0];
+                let a_slab = &accounts[1];
+
+                accounts::expect_signer(a_admin)?;
+                accounts::expect_writable(a_slab)?;
+
+                let mut data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &data)?;
+                require_initialized(&data)?;
+
+                let mut header = state::read_header(&data);
+                require_admin(header.admin, a_admin.key)?;
+
+                header.admin = new_admin.to_bytes();
+                state::write_header(&mut data, &header);
             }
         }
         Ok(())
@@ -1609,6 +1649,12 @@ mod tests {
     fn encode_set_risk_threshold(new_threshold: u128) -> Vec<u8> {
         let mut data = vec![11u8];
         encode_u128(new_threshold, &mut data);
+        data
+    }
+
+    fn encode_update_admin(new_admin: &Pubkey) -> Vec<u8> {
+        let mut data = vec![12u8];
+        encode_pubkey(new_admin, &mut data);
         data
     }
 
@@ -2288,6 +2334,164 @@ mod tests {
             //   expected = 0 + 1 = 1
             // But if OI was cleared by crank (to 0), threshold = 0
             // Either way, threshold should match the formula with current OI
+        }
+    }
+
+    // --- Admin Rotation Tests ---
+
+    #[test]
+    fn test_admin_rotate() {
+        let mut f = setup_market();
+        let init_data = encode_init_market(&f, 100);
+
+        // Init market with admin A
+        {
+            let mut dummy_ata = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
+            let accounts = vec![
+                f.admin.to_info(), f.slab.to_info(), f.mint.to_info(), f.vault.to_info(),
+                f.token_prog.to_info(), dummy_ata.to_info(),
+                f.system.to_info(), f.rent.to_info(), f.pyth_index.to_info(), f.pyth_col.to_info(), f.clock.to_info()
+            ];
+            process_instruction(&f.program_id, &accounts, &init_data).unwrap();
+        }
+
+        // Verify initial admin is set
+        let header = state::read_header(&f.slab.data);
+        assert_eq!(header.admin, f.admin.key.to_bytes());
+
+        // Create new admin B
+        let new_admin_b = Pubkey::new_unique();
+        let mut admin_b_account = TestAccount::new(new_admin_b, solana_program::system_program::id(), 0, vec![]).signer();
+
+        // Admin A rotates to admin B
+        {
+            let accounts = vec![f.admin.to_info(), f.slab.to_info()];
+            process_instruction(&f.program_id, &accounts, &encode_update_admin(&new_admin_b)).unwrap();
+        }
+
+        // Verify admin is now B
+        let header = state::read_header(&f.slab.data);
+        assert_eq!(header.admin, new_admin_b.to_bytes());
+
+        // Create new admin C
+        let new_admin_c = Pubkey::new_unique();
+
+        // Admin B rotates to admin C (proves rotation actually took effect)
+        {
+            let accounts = vec![admin_b_account.to_info(), f.slab.to_info()];
+            process_instruction(&f.program_id, &accounts, &encode_update_admin(&new_admin_c)).unwrap();
+        }
+
+        // Verify admin is now C
+        let header = state::read_header(&f.slab.data);
+        assert_eq!(header.admin, new_admin_c.to_bytes());
+    }
+
+    #[test]
+    fn test_non_admin_cannot_rotate() {
+        let mut f = setup_market();
+        let init_data = encode_init_market(&f, 100);
+
+        // Init market with admin A
+        {
+            let mut dummy_ata = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
+            let accounts = vec![
+                f.admin.to_info(), f.slab.to_info(), f.mint.to_info(), f.vault.to_info(),
+                f.token_prog.to_info(), dummy_ata.to_info(),
+                f.system.to_info(), f.rent.to_info(), f.pyth_index.to_info(), f.pyth_col.to_info(), f.clock.to_info()
+            ];
+            process_instruction(&f.program_id, &accounts, &init_data).unwrap();
+        }
+
+        // Attacker tries to rotate admin
+        let attacker = Pubkey::new_unique();
+        let mut attacker_account = TestAccount::new(attacker, solana_program::system_program::id(), 0, vec![]).signer();
+        let new_admin = Pubkey::new_unique();
+
+        {
+            let accounts = vec![attacker_account.to_info(), f.slab.to_info()];
+            let res = process_instruction(&f.program_id, &accounts, &encode_update_admin(&new_admin));
+            assert_eq!(res, Err(PercolatorError::EngineUnauthorized.into()));
+        }
+
+        // Verify admin unchanged
+        let header = state::read_header(&f.slab.data);
+        assert_eq!(header.admin, f.admin.key.to_bytes());
+    }
+
+    #[test]
+    fn test_burn_admin_to_zero() {
+        let mut f = setup_market();
+        let init_data = encode_init_market(&f, 100);
+
+        // Init market with admin A
+        {
+            let mut dummy_ata = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
+            let accounts = vec![
+                f.admin.to_info(), f.slab.to_info(), f.mint.to_info(), f.vault.to_info(),
+                f.token_prog.to_info(), dummy_ata.to_info(),
+                f.system.to_info(), f.rent.to_info(), f.pyth_index.to_info(), f.pyth_col.to_info(), f.clock.to_info()
+            ];
+            process_instruction(&f.program_id, &accounts, &init_data).unwrap();
+        }
+
+        // Admin burns to zero (Pubkey::default())
+        let zero_admin = Pubkey::default();
+        {
+            let accounts = vec![f.admin.to_info(), f.slab.to_info()];
+            process_instruction(&f.program_id, &accounts, &encode_update_admin(&zero_admin)).unwrap();
+        }
+
+        // Verify admin is now all zeros
+        let header = state::read_header(&f.slab.data);
+        assert_eq!(header.admin, [0u8; 32]);
+    }
+
+    #[test]
+    fn test_after_burn_admin_ops_disabled() {
+        let mut f = setup_market();
+        let init_data = encode_init_market(&f, 100);
+
+        // Init market with admin A
+        {
+            let mut dummy_ata = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
+            let accounts = vec![
+                f.admin.to_info(), f.slab.to_info(), f.mint.to_info(), f.vault.to_info(),
+                f.token_prog.to_info(), dummy_ata.to_info(),
+                f.system.to_info(), f.rent.to_info(), f.pyth_index.to_info(), f.pyth_col.to_info(), f.clock.to_info()
+            ];
+            process_instruction(&f.program_id, &accounts, &init_data).unwrap();
+        }
+
+        // Admin burns to zero
+        let zero_admin = Pubkey::default();
+        {
+            let accounts = vec![f.admin.to_info(), f.slab.to_info()];
+            process_instruction(&f.program_id, &accounts, &encode_update_admin(&zero_admin)).unwrap();
+        }
+
+        // Attempt UpdateAdmin signed by anyone (including zero pubkey signer) → must fail
+        let anyone = Pubkey::new_unique();
+        let mut anyone_account = TestAccount::new(anyone, solana_program::system_program::id(), 0, vec![]).signer();
+        {
+            let accounts = vec![anyone_account.to_info(), f.slab.to_info()];
+            let res = process_instruction(&f.program_id, &accounts, &encode_update_admin(&Pubkey::new_unique()));
+            assert_eq!(res, Err(PercolatorError::EngineUnauthorized.into()));
+        }
+
+        // Attempt SetRiskThreshold signed by anyone → must fail
+        {
+            let accounts = vec![anyone_account.to_info(), f.slab.to_info()];
+            let res = process_instruction(&f.program_id, &accounts, &encode_set_risk_threshold(12345));
+            assert_eq!(res, Err(PercolatorError::EngineUnauthorized.into()));
+        }
+
+        // Even original admin cannot do admin ops anymore
+        let original_admin_key = f.admin.key; // capture before mutable borrow
+        {
+            let accounts = vec![f.admin.to_info(), f.slab.to_info()];
+            let res = process_instruction(&f.program_id, &accounts, &encode_update_admin(&original_admin_key));
+            assert_eq!(res, Err(PercolatorError::EngineUnauthorized.into()));
         }
     }
 }
