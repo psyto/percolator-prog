@@ -642,18 +642,9 @@ pub mod zc {
         Ok(unsafe { &mut *(ptr as *mut RiskEngine) })
     }
 
-    #[inline]
-    pub fn engine_write(data: &mut [u8], engine: RiskEngine) -> Result<(), ProgramError> {
-        if data.len() < ENGINE_OFF + ENGINE_LEN {
-            return Err(ProgramError::InvalidAccountData);
-        }
-        let ptr = unsafe { data.as_mut_ptr().add(ENGINE_OFF) };
-        if (ptr as usize) % ENGINE_ALIGN != 0 {
-            return Err(ProgramError::InvalidAccountData);
-        }
-        unsafe { core::ptr::write(ptr as *mut RiskEngine, engine) };
-        Ok(())
-    }
+    // NOTE: engine_write was removed because it requires passing RiskEngine by value,
+    // which stack-allocates the ~6MB struct and causes stack overflow in BPF.
+    // Use engine_mut() + init_in_place() instead for initialization.
 
     use solana_program::{
         account_info::AccountInfo,
@@ -1481,8 +1472,10 @@ pub mod processor {
 
                 for b in data.iter_mut() { *b = 0; }
 
-                let engine = RiskEngine::new(risk_params);
-                zc::engine_write(&mut data, engine)?;
+                // Initialize engine in-place (zero-copy) to avoid stack overflow.
+                // The data is already zeroed above, so init_in_place only sets non-zero fields.
+                let engine = zc::engine_mut(&mut data)?;
+                engine.init_in_place(risk_params);
 
                 let config = MarketConfig {
                     collateral_mint: a_mint.key.to_bytes(),
