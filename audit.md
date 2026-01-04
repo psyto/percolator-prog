@@ -256,16 +256,24 @@ pub mod verify {
 
 | Instruction | Helpers Used |
 |-------------|--------------|
+| (all) | `len_ok` (via accounts::expect_len), `signer_ok` (via accounts::expect_signer), `writable_ok` (via accounts::expect_writable), `slab_shape_ok` (via slab_guard) |
 | DepositCollateral | `owner_ok` |
 | WithdrawCollateral | `owner_ok` |
 | TradeNoCpi | `owner_ok` (x2), `gate_active` |
-| TradeCpi | `matcher_shape_ok`, `ctx_len_sufficient`, `owner_ok` (x2), `matcher_identity_ok`, `nonce_on_success`, `gate_active`, `cpi_trade_size` |
-| CloseAccount | `owner_ok` |
-| KeeperCrank | `crank_authorized` |
+| TradeCpi | `matcher_shape_ok`, `ctx_len_sufficient`, `owner_ok` (x2), `matcher_identity_ok`, `nonce_on_success`, `gate_active`, `cpi_trade_size`, `lp_pda_shape_ok`, `pda_key_matches`, `oracle_key_ok` |
+| CloseAccount | `owner_ok`, `oracle_key_ok` |
+| KeeperCrank | `crank_authorized`, `oracle_key_ok` |
 | SetRiskThreshold | `admin_ok` (via require_admin) |
 | UpdateAdmin | `admin_ok` (via require_admin) |
 
 **Note:** Kani proofs verify properties of the same code paths the program actually executes.
+All verify helpers are wired into the processor as the single source of truth:
+- `accounts::expect_len` calls `verify::len_ok`
+- `accounts::expect_signer` calls `verify::signer_ok`
+- `accounts::expect_writable` calls `verify::writable_ok`
+- `slab_guard` calls `verify::slab_shape_ok`
+- Oracle key checks call `verify::oracle_key_ok`
+
 The `decide_trade_cpi` helper models the full wrapper decision, enabling Kani to prove
 program-level policies like "reject implies nonce unchanged" and "accept implies uses exec_size".
 

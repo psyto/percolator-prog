@@ -881,21 +881,24 @@ pub mod accounts {
     use crate::error::PercolatorError;
 
     pub fn expect_len(accounts: &[AccountInfo], n: usize) -> Result<(), ProgramError> {
-        if accounts.len() < n {
+        // Length check via verify helper (Kani-provable)
+        if !crate::verify::len_ok(accounts.len(), n) {
             return Err(ProgramError::NotEnoughAccountKeys);
         }
         Ok(())
     }
 
     pub fn expect_signer(ai: &AccountInfo) -> Result<(), ProgramError> {
-        if !ai.is_signer {
+        // Signer check via verify helper (Kani-provable)
+        if !crate::verify::signer_ok(ai.is_signer) {
             return Err(PercolatorError::ExpectedSigner.into());
         }
         Ok(())
     }
 
     pub fn expect_writable(ai: &AccountInfo) -> Result<(), ProgramError> {
-        if !ai.is_writable {
+        // Writable check via verify helper (Kani-provable)
+        if !crate::verify::writable_ok(ai.is_writable) {
             return Err(PercolatorError::ExpectedWritable.into());
         }
         Ok(())
@@ -1216,8 +1219,18 @@ pub mod processor {
     }
 
     fn slab_guard(program_id: &Pubkey, slab: &AccountInfo, data: &[u8]) -> Result<(), ProgramError> {
-        accounts::expect_owner(slab, program_id)?;
-        if data.len() != SLAB_LEN { return Err(PercolatorError::InvalidSlabLen.into()); }
+        // Slab shape validation via verify helper (Kani-provable)
+        let shape = crate::verify::SlabShape {
+            owned_by_program: slab.owner == program_id,
+            correct_len: data.len() == SLAB_LEN,
+        };
+        if !crate::verify::slab_shape_ok(shape) {
+            // Return specific error based on which check failed
+            if slab.owner != program_id {
+                return Err(ProgramError::IllegalOwner);
+            }
+            return Err(PercolatorError::InvalidSlabLen.into());
+        }
         Ok(())
     }
 
@@ -1500,7 +1513,10 @@ pub mod processor {
                     return Err(PercolatorError::EngineUnauthorized.into());
                 }
 
-                accounts::expect_key(a_oracle_idx, &Pubkey::new_from_array(config.index_oracle))?;
+                // Oracle key validation via verify helper (Kani-provable)
+                if !crate::verify::oracle_key_ok(config.index_oracle, a_oracle_idx.key.to_bytes()) {
+                    return Err(ProgramError::InvalidArgument);
+                }
 
                 let (derived_pda, _) = accounts::derive_vault_authority(program_id, a_slab.key);
                 accounts::expect_key(a_vault_pda, &derived_pda)?;
@@ -1743,7 +1759,10 @@ pub mod processor {
                     return Err(PercolatorError::EngineInvalidMatchingEngine.into());
                 }
 
-                accounts::expect_key(a_oracle, &Pubkey::new_from_array(config.index_oracle))?;
+                // Oracle key validation via verify helper (Kani-provable)
+                if !crate::verify::oracle_key_ok(config.index_oracle, a_oracle.key.to_bytes()) {
+                    return Err(ProgramError::InvalidArgument);
+                }
 
                 let clock = Clock::from_account_info(a_clock)?;
                 let price = oracle::read_pyth_price_e6(a_oracle, clock.slot, config.max_staleness_slots, config.conf_filter_bps)?;
