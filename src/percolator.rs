@@ -3167,6 +3167,88 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_permissionless_crank_gc() {
+        // Non-vacuous test: create a dust account and verify GC frees it
+        let mut f = setup_market();
+        let init_data = encode_init_market(&f, 100);
+
+        // Init market
+        {
+            let mut dummy_ata = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
+            let accounts = vec![
+                f.admin.to_info(), f.slab.to_info(), f.mint.to_info(), f.vault.to_info(),
+                f.token_prog.to_info(), dummy_ata.to_info(),
+                f.system.to_info(), f.rent.to_info(), f.pyth_index.to_info(), f.pyth_col.to_info(), f.clock.to_info()
+            ];
+            process_instruction(&f.program_id, &accounts, &init_data).unwrap();
+        }
+
+        // Init user - creates account slot
+        let mut user = TestAccount::new(Pubkey::new_unique(), solana_program::system_program::id(), 0, vec![]).signer();
+        let mut user_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0, make_token_account(f.mint.key, user.key, 1000)).writable();
+        {
+            let accounts = vec![
+                user.to_info(), f.slab.to_info(), user_ata.to_info(), f.vault.to_info(), f.token_prog.to_info(),
+                f.clock.to_info(), f.pyth_col.to_info()
+            ];
+            process_instruction(&f.program_id, &accounts, &encode_init_user(100)).unwrap();
+        }
+        let user_idx = find_idx_by_owner(&f.slab.data, user.key).unwrap();
+
+        // Record state before GC
+        let (used_before, is_used_before) = {
+            let engine = zc::engine_ref(&f.slab.data).unwrap();
+            (engine.num_used_accounts, engine.is_used(user_idx as usize))
+        };
+        assert!(is_used_before, "User account should be used before GC");
+
+        // Directly manipulate account to make it dust:
+        // - capital = 0
+        // - pnl = -1 (small negative)
+        // - position_size = 0 (already 0)
+        // - reserved_pnl = 0 (already 0)
+        // - funding_index = engine.funding_index_qpb_e6
+        {
+            let engine = zc::engine_mut(&mut f.slab.data).unwrap();
+            let funding_idx = engine.funding_index_qpb_e6;
+            let account = &mut engine.accounts[user_idx as usize];
+            account.capital = 0;
+            account.pnl = -1;
+            account.funding_index = funding_idx;
+        }
+
+        // Verify account is now a dust candidate
+        {
+            let engine = zc::engine_ref(&f.slab.data).unwrap();
+            let account = &engine.accounts[user_idx as usize];
+            assert_eq!(account.capital, 0, "capital should be 0");
+            assert_eq!(account.pnl, -1, "pnl should be -1");
+            assert_eq!(account.position_size, 0, "position_size should be 0");
+            assert_eq!(account.reserved_pnl, 0, "reserved_pnl should be 0");
+            assert_eq!(account.funding_index, engine.funding_index_qpb_e6, "funding should match");
+        }
+
+        // Call permissionless crank - should GC the dust account
+        let mut keeper = TestAccount::new(Pubkey::new_unique(), solana_program::system_program::id(), 0, vec![]);
+        {
+            let accs = vec![
+                keeper.to_info(),
+                f.slab.to_info(),
+                f.clock.to_info(),
+                f.pyth_index.to_info(),
+            ];
+            process_instruction(&f.program_id, &accs, &encode_crank_permissionless(0, 0)).unwrap();
+        }
+
+        // Verify GC freed the account
+        {
+            let engine = zc::engine_ref(&f.slab.data).unwrap();
+            assert_eq!(engine.num_used_accounts, used_before - 1, "num_used_accounts should decrease by 1");
+            assert!(!engine.is_used(user_idx as usize), "User account should no longer be used after GC");
+        }
+    }
+
     // --- Admin Rotation Tests ---
 
     #[test]
