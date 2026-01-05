@@ -39,6 +39,14 @@ pub mod constants {
     /// Sentinel value for permissionless crank (no caller account required)
     pub const CRANK_NO_CALLER: u16 = u16::MAX;
 
+    // Inventory-mark funding constants (Option 2)
+    // Funding is computed on-chain from LP inventory + oracle price
+    pub const FUNDING_HORIZON_SLOTS: u64 = 7200;           // ~1 hour @ ~2 slots/sec
+    pub const FUNDING_K_BPS: u64 = 100;                    // 1.00x multiplier
+    pub const FUNDING_INV_SCALE_NOTIONAL_E6: u128 = 1_000_000_000_000; // 1M USDC notional in e6
+    pub const FUNDING_MAX_PREMIUM_BPS: i64 = 500;          // cap premium at 5.00%
+    pub const FUNDING_MAX_BPS_PER_SLOT: i64 = 5;           // cap per-slot funding
+
     // Matcher call ABI offsets (67-byte layout)
     // byte 0: tag (u8)
     // 1..9: req_id (u64)
@@ -155,6 +163,59 @@ impl LpRiskState {
 /// Used by KeeperCrank for threshold updates.
 fn compute_system_risk_units(engine: &percolator::RiskEngine) -> u128 {
     LpRiskState::compute(engine).risk()
+}
+
+/// Compute net LP position for inventory-based funding.
+/// Sums position_size across all LP accounts.
+fn compute_net_lp_pos(engine: &percolator::RiskEngine) -> i128 {
+    let mut net: i128 = 0;
+    for i in 0..percolator::MAX_ACCOUNTS {
+        if engine.is_used(i) && engine.accounts[i].is_lp() {
+            net = net.saturating_add(engine.accounts[i].position_size);
+        }
+    }
+    net
+}
+
+/// Compute inventory-based funding rate (bps per slot).
+/// Funding is proportional to LP inventory to incentivize balance.
+/// Sign convention: positive when LP is net long (pushes toward short).
+fn compute_inventory_funding_bps_per_slot(net_lp_pos: i128, price_e6: u64) -> i64 {
+    use crate::constants::{
+        FUNDING_HORIZON_SLOTS, FUNDING_K_BPS, FUNDING_INV_SCALE_NOTIONAL_E6,
+        FUNDING_MAX_PREMIUM_BPS, FUNDING_MAX_BPS_PER_SLOT
+    };
+
+    if net_lp_pos == 0 || price_e6 == 0 {
+        return 0;
+    }
+
+    let abs_pos: u128 = net_lp_pos.unsigned_abs();
+    let notional_e6: u128 = abs_pos.saturating_mul(price_e6 as u128) / 1_000_000u128;
+
+    // premium_bps = (notional / scale) * k_bps, capped
+    let mut premium_bps_u: u128 = notional_e6
+        .saturating_mul(FUNDING_K_BPS as u128)
+        / FUNDING_INV_SCALE_NOTIONAL_E6;
+
+    if premium_bps_u > (FUNDING_MAX_PREMIUM_BPS.unsigned_abs() as u128) {
+        premium_bps_u = FUNDING_MAX_PREMIUM_BPS.unsigned_abs() as u128;
+    }
+
+    // Apply sign: if LP net long (net_lp_pos > 0), funding is positive
+    let signed_premium_bps: i64 = if net_lp_pos > 0 {
+        premium_bps_u as i64
+    } else {
+        -(premium_bps_u as i64)
+    };
+
+    // Convert to per-slot by dividing by horizon
+    let mut per_slot: i64 = signed_premium_bps / (FUNDING_HORIZON_SLOTS as i64);
+
+    // Clamp final
+    if per_slot > FUNDING_MAX_BPS_PER_SLOT { per_slot = FUNDING_MAX_BPS_PER_SLOT; }
+    if per_slot < -FUNDING_MAX_BPS_PER_SLOT { per_slot = -FUNDING_MAX_BPS_PER_SLOT; }
+    per_slot
 }
 
 // =============================================================================
@@ -825,7 +886,7 @@ pub mod ix {
         InitLP { matcher_program: Pubkey, matcher_context: Pubkey, fee_payment: u64 },
         DepositCollateral { user_idx: u16, amount: u64 },
         WithdrawCollateral { user_idx: u16, amount: u64 },
-        KeeperCrank { caller_idx: u16, funding_rate_bps_per_slot: i64, allow_panic: u8 },
+        KeeperCrank { caller_idx: u16, allow_panic: u8 },
         TradeNoCpi { lp_idx: u16, user_idx: u16, size: i128 },
         LiquidateAtOracle { target_idx: u16 },
         CloseAccount { user_idx: u16 },
@@ -875,9 +936,8 @@ pub mod ix {
                 },
                 5 => { // KeeperCrank
                     let caller_idx = read_u16(&mut rest)?;
-                    let funding_rate_bps_per_slot = read_i64(&mut rest)?;
                     let allow_panic = read_u8(&mut rest)?;
-                    Ok(Instruction::KeeperCrank { caller_idx, funding_rate_bps_per_slot, allow_panic })
+                    Ok(Instruction::KeeperCrank { caller_idx, allow_panic })
                 },
                 6 => { // TradeNoCpi
                     let lp_idx = read_u16(&mut rest)?;
@@ -934,13 +994,6 @@ pub mod ix {
         let (bytes, rest) = input.split_at(8);
         *input = rest;
         Ok(u64::from_le_bytes(bytes.try_into().unwrap()))
-    }
-
-    fn read_i64(input: &mut &[u8]) -> Result<i64, ProgramError> {
-        if input.len() < 8 { return Err(ProgramError::InvalidInstructionData); }
-        let (bytes, rest) = input.split_at(8);
-        *input = rest;
-        Ok(i64::from_le_bytes(bytes.try_into().unwrap()))
     }
 
     fn read_i128(input: &mut &[u8]) -> Result<i128, ProgramError> {
@@ -1049,7 +1102,7 @@ pub mod state {
         pub bump: u8,
         pub _padding: [u8; 3],
         pub admin: [u8; 32],
-        pub _reserved: [u8; 16],
+        pub _reserved: [u8; 24], // [0..8]=nonce, [8..16]=last_thr_slot, [16..24]=last_funding_slot
     }
 
     /// Offset of _reserved field in SlabHeader, derived from offset_of! for correctness.
@@ -1112,6 +1165,16 @@ pub mod state {
     /// Write the last threshold update slot to _reserved[8..16].
     pub fn write_last_thr_update_slot(data: &mut [u8], slot: u64) {
         data[RESERVED_OFF + 8..RESERVED_OFF + 16].copy_from_slice(&slot.to_le_bytes());
+    }
+
+    /// Read the last funding slot from _reserved[16..24].
+    pub fn read_last_funding_slot(data: &[u8]) -> u64 {
+        u64::from_le_bytes(data[RESERVED_OFF + 16..RESERVED_OFF + 24].try_into().unwrap())
+    }
+
+    /// Write the last funding slot to _reserved[16..24].
+    pub fn write_last_funding_slot(data: &mut [u8], slot: u64) {
+        data[RESERVED_OFF + 16..RESERVED_OFF + 24].copy_from_slice(&slot.to_le_bytes());
     }
 
     pub fn read_config(data: &[u8]) -> MarketConfig {
@@ -1313,6 +1376,7 @@ pub mod processor {
         program_error::ProgramError,
         program_pack::Pack,
         msg,
+        log::sol_log_compute_units,
     };
     use crate::{
         ix::Instruction,
@@ -1515,13 +1579,15 @@ pub mod processor {
                     bump,
                     _padding: [0; 3],
                     admin: a_admin.key.to_bytes(),
-                    _reserved: [0; 16],
+                    _reserved: [0; 24],
                 };
                 state::write_header(&mut data, &new_header);
                 // Step 4: Explicitly initialize nonce to 0 for determinism
                 state::write_req_nonce(&mut data, 0);
                 // Initialize threshold update slot to 0
                 state::write_last_thr_update_slot(&mut data, 0);
+                // Initialize last funding slot to 0
+                state::write_last_funding_slot(&mut data, 0);
             },
             Instruction::InitUser { fee_payment } => {
                 accounts::expect_len(accounts, 7)?;
@@ -1686,7 +1752,7 @@ pub mod processor {
                     &signer_seeds,
                 )?;
             },
-            Instruction::KeeperCrank { caller_idx, funding_rate_bps_per_slot, allow_panic } => {
+            Instruction::KeeperCrank { caller_idx, allow_panic } => {
                 use crate::constants::CRANK_NO_CALLER;
 
                 accounts::expect_len(accounts, 4)?;
@@ -1710,6 +1776,13 @@ pub mod processor {
                 let config = state::read_config(&data);
                 // Read last threshold update slot BEFORE mutable engine borrow
                 let last_thr_slot = state::read_last_thr_update_slot(&data);
+                // Read last funding slot for at-most-once-per-slot gating
+                let last_funding_slot = state::read_last_funding_slot(&data);
+
+                // Oracle key validation via verify helper (Kani-provable)
+                if !crate::verify::oracle_key_ok(config.index_oracle, a_oracle.key.to_bytes()) {
+                    return Err(ProgramError::InvalidArgument);
+                }
 
                 let engine = zc::engine_mut(&mut data)?;
 
@@ -1730,7 +1803,28 @@ pub mod processor {
                 // Execute crank with effective_caller_idx for clarity
                 // In permissionless mode, pass CRANK_NO_CALLER to engine (out-of-range = no caller settle)
                 let effective_caller_idx = if permissionless { CRANK_NO_CALLER } else { caller_idx };
-                let _outcome = engine.keeper_crank(effective_caller_idx, clock.slot, price, funding_rate_bps_per_slot, allow_panic != 0).map_err(map_risk_error)?;
+
+                // Compute inventory-based funding rate (Option 2 - permissionless)
+                // At-most-once-per-slot gating to prevent compounding attacks
+                let effective_funding_rate = if clock.slot <= last_funding_slot {
+                    // Funding already applied this slot, skip to prevent compounding
+                    0
+                } else {
+                    // Compute funding from LP inventory
+                    let net_lp_pos = crate::compute_net_lp_pos(engine);
+                    crate::compute_inventory_funding_bps_per_slot(net_lp_pos, price)
+                };
+                #[cfg(feature = "cu-audit")]
+                {
+                    msg!("CU_CHECKPOINT: keeper_crank_start");
+                    sol_log_compute_units();
+                }
+                let _outcome = engine.keeper_crank(effective_caller_idx, clock.slot, price, effective_funding_rate, allow_panic != 0).map_err(map_risk_error)?;
+                #[cfg(feature = "cu-audit")]
+                {
+                    msg!("CU_CHECKPOINT: keeper_crank_end");
+                    sol_log_compute_units();
+                }
 
                 // --- Threshold auto-update (rate-limited + EWMA smoothed + step-clamped)
                 if clock.slot >= last_thr_slot.saturating_add(THRESH_UPDATE_INTERVAL_SLOTS) {
@@ -1761,6 +1855,11 @@ pub mod processor {
                     };
                     engine.set_risk_reduction_threshold(final_thresh.clamp(THRESH_MIN, THRESH_MAX));
                     state::write_last_thr_update_slot(&mut data, clock.slot);
+                }
+
+                // Persist last_funding_slot if funding was applied this slot
+                if clock.slot > last_funding_slot {
+                    state::write_last_funding_slot(&mut data, clock.slot);
                 }
             },
             Instruction::TradeNoCpi { lp_idx, user_idx, size } => {
@@ -1804,14 +1903,34 @@ pub mod processor {
                 let bal = engine.insurance_fund.balance;
                 let thr = engine.risk_reduction_threshold();
                 if crate::verify::gate_active(thr, bal) {
+                    #[cfg(feature = "cu-audit")]
+                    {
+                        msg!("CU_CHECKPOINT: trade_nocpi_compute_start");
+                        sol_log_compute_units();
+                    }
                     let risk_state = crate::LpRiskState::compute(engine);
+                    #[cfg(feature = "cu-audit")]
+                    {
+                        msg!("CU_CHECKPOINT: trade_nocpi_compute_end");
+                        sol_log_compute_units();
+                    }
                     let old_lp_pos = engine.accounts[lp_idx as usize].position_size;
                     if risk_state.would_increase_risk(old_lp_pos, -size) {
                         return Err(PercolatorError::EngineRiskReductionOnlyMode.into());
                     }
                 }
 
+                #[cfg(feature = "cu-audit")]
+                {
+                    msg!("CU_CHECKPOINT: trade_nocpi_execute_start");
+                    sol_log_compute_units();
+                }
                 engine.execute_trade(&NoOpMatcher, lp_idx, user_idx, clock.slot, price, size).map_err(map_risk_error)?;
+                #[cfg(feature = "cu-audit")]
+                {
+                    msg!("CU_CHECKPOINT: trade_nocpi_execute_end");
+                    sol_log_compute_units();
+                }
             },
             Instruction::TradeCpi { lp_idx, user_idx, size } => {
                 // Phase 1: Updated account layout - lp_pda must be in accounts
@@ -1979,7 +2098,17 @@ pub mod processor {
                     let bal = engine.insurance_fund.balance;
                     let thr = engine.risk_reduction_threshold();
                     if crate::verify::gate_active(thr, bal) {
+                        #[cfg(feature = "cu-audit")]
+                        {
+                            msg!("CU_CHECKPOINT: trade_cpi_compute_start");
+                            sol_log_compute_units();
+                        }
                         let risk_state = crate::LpRiskState::compute(engine);
+                        #[cfg(feature = "cu-audit")]
+                        {
+                            msg!("CU_CHECKPOINT: trade_cpi_compute_end");
+                            sol_log_compute_units();
+                        }
                         let old_lp_pos = engine.accounts[lp_idx as usize].position_size;
                         if risk_state.would_increase_risk(old_lp_pos, -ret.exec_size) {
                             return Err(PercolatorError::EngineRiskReductionOnlyMode.into());
@@ -1988,7 +2117,17 @@ pub mod processor {
 
                     // Trade size selection via verify helper (Kani-provable: uses exec_size, not requested_size)
                     let trade_size = crate::verify::cpi_trade_size(ret.exec_size, size);
+                    #[cfg(feature = "cu-audit")]
+                    {
+                        msg!("CU_CHECKPOINT: trade_cpi_execute_start");
+                        sol_log_compute_units();
+                    }
                     engine.execute_trade(&matcher, lp_idx, user_idx, clock.slot, price, trade_size).map_err(map_risk_error)?;
+                    #[cfg(feature = "cu-audit")]
+                    {
+                        msg!("CU_CHECKPOINT: trade_cpi_execute_end");
+                        sol_log_compute_units();
+                    }
                     // Write nonce AFTER CPI and execute_trade to avoid ExternalAccountDataModified
                     state::write_req_nonce(&mut data, req_id);
                 }
@@ -1996,6 +2135,7 @@ pub mod processor {
             Instruction::LiquidateAtOracle { target_idx } => {
                 accounts::expect_len(accounts, 4)?;
                 let a_slab = &accounts[1];
+                let a_oracle = &accounts[3];
                 accounts::expect_writable(a_slab)?;
 
                 let mut data = state::slab_data_mut(a_slab)?;
@@ -2003,14 +2143,29 @@ pub mod processor {
                 require_initialized(&data)?;
                 let config = state::read_config(&data);
 
+                // Oracle key validation via verify helper (Kani-provable)
+                if !crate::verify::oracle_key_ok(config.index_oracle, a_oracle.key.to_bytes()) {
+                    return Err(ProgramError::InvalidArgument);
+                }
+
                 let engine = zc::engine_mut(&mut data)?;
 
                 check_idx(engine, target_idx)?;
 
                 let clock = Clock::from_account_info(&accounts[2])?;
-                let price = oracle::read_pyth_price_e6(&accounts[3], clock.slot, config.max_staleness_slots, config.conf_filter_bps)?;
+                let price = oracle::read_pyth_price_e6(a_oracle, clock.slot, config.max_staleness_slots, config.conf_filter_bps)?;
 
+                #[cfg(feature = "cu-audit")]
+                {
+                    msg!("CU_CHECKPOINT: liquidate_start");
+                    sol_log_compute_units();
+                }
                 let _res = engine.liquidate_at_oracle(target_idx, clock.slot, price).map_err(map_risk_error)?;
+                #[cfg(feature = "cu-audit")]
+                {
+                    msg!("CU_CHECKPOINT: liquidate_end");
+                    sol_log_compute_units();
+                }
             },
             Instruction::CloseAccount { user_idx } => {
                 accounts::expect_len(accounts, 8)?;
@@ -2020,18 +2175,27 @@ pub mod processor {
                 let a_user_ata = &accounts[3];
                 let a_pda = &accounts[4];
                 let a_token = &accounts[5];
+                let a_oracle = &accounts[7];
 
                 accounts::expect_signer(a_user)?;
                 accounts::expect_writable(a_slab)?;
-                
+                verify_token_program(a_token)?;
+
                 let mut data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &data)?;
                 require_initialized(&data)?;
                 let config = state::read_config(&data);
+                let mint = Pubkey::new_from_array(config.collateral_mint);
 
                 let (auth, _) = accounts::derive_vault_authority(program_id, a_slab.key);
-                verify_vault(a_vault, &auth, &Pubkey::new_from_array(config.collateral_mint), &Pubkey::new_from_array(config.vault_pubkey))?;
+                verify_vault(a_vault, &auth, &mint, &Pubkey::new_from_array(config.vault_pubkey))?;
+                verify_token_account(a_user_ata, a_user.key, &mint)?;
                 accounts::expect_key(a_pda, &auth)?;
+
+                // Oracle key validation via verify helper (Kani-provable)
+                if !crate::verify::oracle_key_ok(config.index_oracle, a_oracle.key.to_bytes()) {
+                    return Err(ProgramError::InvalidArgument);
+                }
 
                 let engine = zc::engine_mut(&mut data)?;
 
@@ -2044,9 +2208,19 @@ pub mod processor {
                 }
 
                 let clock = Clock::from_account_info(&accounts[6])?;
-                let price = oracle::read_pyth_price_e6(&accounts[7], clock.slot, config.max_staleness_slots, config.conf_filter_bps)?;
+                let price = oracle::read_pyth_price_e6(a_oracle, clock.slot, config.max_staleness_slots, config.conf_filter_bps)?;
 
+                #[cfg(feature = "cu-audit")]
+                {
+                    msg!("CU_CHECKPOINT: close_account_start");
+                    sol_log_compute_units();
+                }
                 let amt = engine.close_account(user_idx, clock.slot, price).map_err(map_risk_error)?;
+                #[cfg(feature = "cu-audit")]
+                {
+                    msg!("CU_CHECKPOINT: close_account_end");
+                    sol_log_compute_units();
+                }
                 let amt_u64: u64 = amt.try_into().map_err(|_| PercolatorError::EngineOverflow)?;
 
                 let seed1: &[u8] = b"vault";
@@ -2334,16 +2508,15 @@ mod tests {
         data
     }
 
-    fn encode_crank(caller: u16, rate: i64, panic: u8) -> Vec<u8> {
+    fn encode_crank(caller: u16, panic: u8) -> Vec<u8> {
         let mut data = vec![5u8];
         encode_u16(caller, &mut data);
-        data.extend_from_slice(&rate.to_le_bytes());
         data.push(panic);
         data
     }
 
-    fn encode_crank_permissionless(rate: i64, panic: u8) -> Vec<u8> {
-        encode_crank(u16::MAX, rate, panic)
+    fn encode_crank_permissionless(panic: u8) -> Vec<u8> {
+        encode_crank(u16::MAX, panic)
     }
 
     fn encode_trade(lp: u16, user: u16, size: i128) -> Vec<u8> {
@@ -2505,9 +2678,9 @@ mod tests {
 
         {
             let accounts = vec![
-                user.to_info(), f.slab.to_info(), f.clock.to_info(), f.pyth_col.to_info()
+                user.to_info(), f.slab.to_info(), f.clock.to_info(), f.pyth_index.to_info()
             ];
-            process_instruction(&f.program_id, &accounts, &encode_crank(user_idx, 0, 0)).unwrap();
+            process_instruction(&f.program_id, &accounts, &encode_crank(user_idx, 0)).unwrap();
         }
 
         {
@@ -2627,9 +2800,9 @@ mod tests {
 
         {
             let accs = vec![
-                user.to_info(), f.slab.to_info(), f.clock.to_info(), f.pyth_col.to_info()
+                user.to_info(), f.slab.to_info(), f.clock.to_info(), f.pyth_index.to_info()
             ];
-            process_instruction(&f.program_id, &accs, &encode_crank(user_idx, 0, 0)).unwrap();
+            process_instruction(&f.program_id, &accs, &encode_crank(user_idx, 0)).unwrap();
         }
 
         let mut attacker = TestAccount::new(Pubkey::new_unique(), solana_program::system_program::id(), 0, vec![]).signer();
@@ -2694,14 +2867,14 @@ mod tests {
             process_instruction(&f.program_id, &accs, &encode_deposit(lp_idx, 1000)).unwrap();
         }
         {
-            let accs = vec![user.to_info(), f.slab.to_info(), f.clock.to_info(), f.pyth_col.to_info()];
-            process_instruction(&f.program_id, &accs, &encode_crank(user_idx, 0, 0)).unwrap();
+            let accs = vec![user.to_info(), f.slab.to_info(), f.clock.to_info(), f.pyth_index.to_info()];
+            process_instruction(&f.program_id, &accs, &encode_crank(user_idx, 0)).unwrap();
         }
 
         let mut attacker = TestAccount::new(Pubkey::new_unique(), solana_program::system_program::id(), 0, vec![]).signer();
         {
             let accs = vec![
-                attacker.to_info(), lp.to_info(), f.slab.to_info(), f.clock.to_info(), f.pyth_col.to_info()
+                attacker.to_info(), lp.to_info(), f.slab.to_info(), f.clock.to_info(), f.pyth_index.to_info()
             ];
             let res = process_instruction(&f.program_id, &accs, &encode_trade(lp_idx, user_idx, 100));
             assert_eq!(res, Err(PercolatorError::EngineUnauthorized.into()));
@@ -3071,8 +3244,8 @@ mod tests {
         // We need to advance the clock
         f.clock.data = make_clock(100); // Advance past rate limit
         {
-            let accs = vec![user.to_info(), f.slab.to_info(), f.clock.to_info(), f.pyth_col.to_info()];
-            process_instruction(&f.program_id, &accs, &encode_crank(user_idx, 0, 0)).unwrap();
+            let accs = vec![user.to_info(), f.slab.to_info(), f.clock.to_info(), f.pyth_index.to_info()];
+            process_instruction(&f.program_id, &accs, &encode_crank(user_idx, 0)).unwrap();
         }
 
         // Verify threshold update ran by checking last_thr_update_slot
@@ -3143,7 +3316,7 @@ mod tests {
                 f.pyth_index.to_info(),
             ];
             // Use encode_crank_permissionless which passes u16::MAX as caller_idx
-            process_instruction(&f.program_id, &accs, &encode_crank_permissionless(0, 0)).unwrap();
+            process_instruction(&f.program_id, &accs, &encode_crank_permissionless(0)).unwrap();
         }
 
         // Verify crank was executed (we can check that the engine is still valid)
@@ -3228,7 +3401,7 @@ mod tests {
                 f.clock.to_info(),
                 f.pyth_index.to_info(),
             ];
-            process_instruction(&f.program_id, &accs, &encode_crank_permissionless(0, 0)).unwrap();
+            process_instruction(&f.program_id, &accs, &encode_crank_permissionless(0)).unwrap();
         }
 
         // Verify GC freed the account

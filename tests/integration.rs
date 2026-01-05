@@ -145,10 +145,9 @@ fn encode_deposit(idx: u16, amount: u64) -> Vec<u8> {
     v
 }
 
-fn encode_crank(caller_idx: u16, rate: i64, allow_panic: u8) -> Vec<u8> {
+fn encode_crank(caller_idx: u16, allow_panic: u8) -> Vec<u8> {
     let mut v = vec![5u8];
     v.extend_from_slice(&caller_idx.to_le_bytes());
-    v.extend_from_slice(&rate.to_le_bytes());
     v.push(allow_panic);
     v
 }
@@ -293,7 +292,7 @@ async fn integration_trade_cpi_real_trade_success() {
     let ix = Instruction {
         program_id: percolator_id,
         accounts: vec![AccountMeta::new(user.pubkey(), true), AccountMeta::new(slab.pubkey(), false), AccountMeta::new_readonly(solana_sdk::sysvar::clock::ID, false), AccountMeta::new_readonly(pyth_index, false)],
-        data: encode_crank(user_idx, 0, 0),
+        data: encode_crank(user_idx, 0),
     };
     let mut tx = Transaction::new_with_payer(&[ix], Some(&payer.pubkey()));
     tx.sign(&[&payer, &user], banks.get_latest_blockhash().await.unwrap());
@@ -303,7 +302,7 @@ async fn integration_trade_cpi_real_trade_success() {
     let ix = Instruction {
         program_id: percolator_id,
         accounts: vec![AccountMeta::new(lp.pubkey(), true), AccountMeta::new(slab.pubkey(), false), AccountMeta::new_readonly(solana_sdk::sysvar::clock::ID, false), AccountMeta::new_readonly(pyth_index, false)],
-        data: encode_crank(lp_idx, 0, 0),
+        data: encode_crank(lp_idx, 0),
     };
     let mut tx = Transaction::new_with_payer(&[ix], Some(&payer.pubkey()));
     tx.sign(&[&payer, &lp], banks.get_latest_blockhash().await.unwrap());
@@ -354,9 +353,9 @@ async fn integration_trade_cpi_real_trade_success() {
             AccountMeta::new(user.pubkey(), true),    // caller (signer)
             AccountMeta::new(slab.pubkey(), false),   // slab (writable)
             AccountMeta::new_readonly(solana_sdk::sysvar::clock::ID, false),
-            AccountMeta::new_readonly(pyth_collateral, false),
+            AccountMeta::new_readonly(pyth_index, false),
         ],
-        data: encode_crank(user_idx, 0, 0),
+        data: encode_crank(user_idx, 0),
     };
     let mut tx = Transaction::new_with_payer(&[ix], Some(&payer.pubkey()));
     tx.sign(&[&payer, &user], banks.get_latest_blockhash().await.unwrap());
@@ -614,10 +613,10 @@ async fn integration_nonce_increments() {
     let ix = Instruction { program_id: percolator_id, accounts: vec![AccountMeta::new(user.pubkey(), true), AccountMeta::new(slab.pubkey(), false), AccountMeta::new(user_ata, false), AccountMeta::new(vault, false), AccountMeta::new_readonly(spl_token::ID, false)], data: encode_top_up_insurance(100) };
     let mut tx = Transaction::new_with_payer(&[ix], Some(&payer.pubkey())); tx.sign(&[&payer, &user], banks.get_latest_blockhash().await.unwrap()); banks.process_transaction(tx).await.unwrap();
 
-    let ix = Instruction { program_id: percolator_id, accounts: vec![AccountMeta::new(user.pubkey(), true), AccountMeta::new(slab.pubkey(), false), AccountMeta::new_readonly(solana_sdk::sysvar::clock::ID, false), AccountMeta::new_readonly(pyth_index, false)], data: encode_crank(user_idx, 0, 0) };
+    let ix = Instruction { program_id: percolator_id, accounts: vec![AccountMeta::new(user.pubkey(), true), AccountMeta::new(slab.pubkey(), false), AccountMeta::new_readonly(solana_sdk::sysvar::clock::ID, false), AccountMeta::new_readonly(pyth_index, false)], data: encode_crank(user_idx, 0) };
     let mut tx = Transaction::new_with_payer(&[ix], Some(&payer.pubkey())); tx.sign(&[&payer, &user], banks.get_latest_blockhash().await.unwrap()); banks.process_transaction(tx).await.unwrap();
 
-    let ix = Instruction { program_id: percolator_id, accounts: vec![AccountMeta::new(lp.pubkey(), true), AccountMeta::new(slab.pubkey(), false), AccountMeta::new_readonly(solana_sdk::sysvar::clock::ID, false), AccountMeta::new_readonly(pyth_index, false)], data: encode_crank(lp_idx, 0, 0) };
+    let ix = Instruction { program_id: percolator_id, accounts: vec![AccountMeta::new(lp.pubkey(), true), AccountMeta::new(slab.pubkey(), false), AccountMeta::new_readonly(solana_sdk::sysvar::clock::ID, false), AccountMeta::new_readonly(pyth_index, false)], data: encode_crank(lp_idx, 0) };
     let mut tx = Transaction::new_with_payer(&[ix], Some(&payer.pubkey())); tx.sign(&[&payer, &lp], banks.get_latest_blockhash().await.unwrap()); banks.process_transaction(tx).await.unwrap();
 
     // Verify nonce is 0 before trade
@@ -778,10 +777,10 @@ async fn integration_replay_req_id_rejected() {
     let ix = Instruction { program_id: percolator_id, accounts: vec![AccountMeta::new(user.pubkey(), true), AccountMeta::new(slab.pubkey(), false), AccountMeta::new(user_ata, false), AccountMeta::new(vault, false), AccountMeta::new_readonly(spl_token::ID, false)], data: encode_top_up_insurance(100) };
     let mut tx = Transaction::new_with_payer(&[ix], Some(&payer.pubkey())); tx.sign(&[&payer, &user], banks.get_latest_blockhash().await.unwrap()); banks.process_transaction(tx).await.unwrap();
 
-    let ix = Instruction { program_id: percolator_id, accounts: vec![AccountMeta::new(user.pubkey(), true), AccountMeta::new(slab.pubkey(), false), AccountMeta::new_readonly(solana_sdk::sysvar::clock::ID, false), AccountMeta::new_readonly(pyth_index, false)], data: encode_crank(user_idx, 0, 0) };
+    let ix = Instruction { program_id: percolator_id, accounts: vec![AccountMeta::new(user.pubkey(), true), AccountMeta::new(slab.pubkey(), false), AccountMeta::new_readonly(solana_sdk::sysvar::clock::ID, false), AccountMeta::new_readonly(pyth_index, false)], data: encode_crank(user_idx, 0) };
     let mut tx = Transaction::new_with_payer(&[ix], Some(&payer.pubkey())); tx.sign(&[&payer, &user], banks.get_latest_blockhash().await.unwrap()); banks.process_transaction(tx).await.unwrap();
 
-    let ix = Instruction { program_id: percolator_id, accounts: vec![AccountMeta::new(lp.pubkey(), true), AccountMeta::new(slab.pubkey(), false), AccountMeta::new_readonly(solana_sdk::sysvar::clock::ID, false), AccountMeta::new_readonly(pyth_index, false)], data: encode_crank(lp_idx, 0, 0) };
+    let ix = Instruction { program_id: percolator_id, accounts: vec![AccountMeta::new(lp.pubkey(), true), AccountMeta::new(slab.pubkey(), false), AccountMeta::new_readonly(solana_sdk::sysvar::clock::ID, false), AccountMeta::new_readonly(pyth_index, false)], data: encode_crank(lp_idx, 0) };
     let mut tx = Transaction::new_with_payer(&[ix], Some(&payer.pubkey())); tx.sign(&[&payer, &lp], banks.get_latest_blockhash().await.unwrap()); banks.process_transaction(tx).await.unwrap();
 
     // Record nonce before trade
