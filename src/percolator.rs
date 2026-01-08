@@ -2715,11 +2715,19 @@ pub mod processor {
                 accounts::expect_signer(a_dest)?;
                 accounts::expect_writable(a_slab)?;
 
-                let mut data = state::slab_data_mut(a_slab)?;
+                // With unsafe_close: skip all validation, directly access raw account data
+                // This works even if slab data layout has changed between builds
+                #[cfg(feature = "unsafe_close")]
+                {
+                    let mut data = a_slab.try_borrow_mut_data()?;
+                    for b in data.iter_mut() {
+                        *b = 0;
+                    }
+                }
 
-                // All validation skipped with unsafe_close feature (for devnet cleanup)
                 #[cfg(not(feature = "unsafe_close"))]
                 {
+                    let mut data = state::slab_data_mut(a_slab)?;
                     slab_guard(program_id, a_slab, &data)?;
                     require_initialized(&data)?;
 
@@ -2736,13 +2744,12 @@ pub mod processor {
                     if engine.num_used_accounts != 0 {
                         return Err(PercolatorError::EngineAccountNotFound.into());
                     }
-                }
 
-                // Zero out the slab data to prevent reuse
-                for b in data.iter_mut() {
-                    *b = 0;
+                    // Zero out the slab data to prevent reuse
+                    for b in data.iter_mut() {
+                        *b = 0;
+                    }
                 }
-                drop(data);
 
                 // Transfer all lamports from slab to destination
                 let slab_lamports = a_slab.lamports();
