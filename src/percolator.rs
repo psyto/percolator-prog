@@ -351,9 +351,9 @@ pub mod verify {
         s.is_system_owned && s.data_len_zero && s.lamports_zero
     }
 
-    /// Oracle key check: provided oracle must match expected config oracle.
+    /// Oracle feed ID check: provided feed_id must match expected config feed_id.
     #[inline]
-    pub fn oracle_key_ok(expected: [u8; 32], provided: [u8; 32]) -> bool {
+    pub fn oracle_feed_id_ok(expected: [u8; 32], provided: [u8; 32]) -> bool {
         expected == provided
     }
 
@@ -1013,9 +1013,10 @@ pub mod ix {
         InitMarket {
             admin: Pubkey,
             collateral_mint: Pubkey,
-            pyth_index: Pubkey,
-            pyth_collateral: Pubkey,
-            max_staleness_slots: u64,
+            /// Pyth feed ID for the index price (32 bytes)
+            index_feed_id: [u8; 32],
+            /// Maximum staleness in seconds
+            max_staleness_secs: u64,
             conf_filter_bps: u16,
             /// If non-zero, invert oracle price (USD/SOL -> SOL/USD)
             invert: u8,
@@ -1045,16 +1046,15 @@ pub mod ix {
                 0 => { // InitMarket
                     let admin = read_pubkey(&mut rest)?;
                     let collateral_mint = read_pubkey(&mut rest)?;
-                    let pyth_index = read_pubkey(&mut rest)?;
-                    let pyth_collateral = read_pubkey(&mut rest)?;
-                    let max_staleness_slots = read_u64(&mut rest)?;
+                    let index_feed_id = read_bytes32(&mut rest)?;
+                    let max_staleness_secs = read_u64(&mut rest)?;
                     let conf_filter_bps = read_u16(&mut rest)?;
                     let invert = read_u8(&mut rest)?;
                     let unit_scale = read_u32(&mut rest)?;
                     let risk_params = read_risk_params(&mut rest)?;
                     Ok(Instruction::InitMarket {
-                        admin, collateral_mint, pyth_index, pyth_collateral,
-                        max_staleness_slots, conf_filter_bps, invert, unit_scale, risk_params
+                        admin, collateral_mint, index_feed_id,
+                        max_staleness_secs, conf_filter_bps, invert, unit_scale, risk_params
                     })
                 },
                 1 => { // InitUser
@@ -1167,6 +1167,13 @@ pub mod ix {
         Ok(Pubkey::new_from_array(bytes.try_into().unwrap()))
     }
 
+    fn read_bytes32(input: &mut &[u8]) -> Result<[u8; 32], ProgramError> {
+        if input.len() < 32 { return Err(ProgramError::InvalidInstructionData); }
+        let (bytes, rest) = input.split_at(32);
+        *input = rest;
+        Ok(bytes.try_into().unwrap())
+    }
+
     fn read_risk_params(input: &mut &[u8]) -> Result<RiskParams, ProgramError> {
         Ok(RiskParams {
             warmup_period_slots: read_u64(input)?,
@@ -1266,9 +1273,12 @@ pub mod state {
     pub struct MarketConfig {
         pub collateral_mint: [u8; 32],
         pub vault_pubkey: [u8; 32],
-        pub collateral_oracle: [u8; 32],
-        pub index_oracle: [u8; 32],
-        pub max_staleness_slots: u64,
+        /// Reserved for future use (was collateral_oracle, unused)
+        pub _reserved: [u8; 32],
+        /// Pyth feed ID for the index price feed
+        pub index_feed_id: [u8; 32],
+        /// Maximum staleness in seconds (Pyth Pull uses unix timestamps)
+        pub max_staleness_secs: u64,
         pub conf_filter_bps: u16,
         pub vault_authority_bump: u8,
         /// If non-zero, invert the oracle price (USD_per_SOL -> SOL_per_USD)
@@ -1389,110 +1399,95 @@ pub mod oracle {
     // SECURITY (H5): The "devnet" feature disables critical oracle safety checks:
     // - Staleness validation (stale prices accepted)
     // - Confidence interval validation (wide confidence accepted)
-    // - Trading status validation (halted prices accepted)
     //
     // WARNING: NEVER deploy to mainnet with the "devnet" feature enabled!
     // Build for mainnet with: cargo build-sbf (without --features devnet)
 
-    /// Pyth mainnet price program ID
-    #[cfg(not(feature = "devnet"))]
-    pub const PYTH_PROGRAM_ID: Pubkey = Pubkey::new_from_array([
-        0x92, 0x6a, 0xb1, 0x3b, 0x47, 0x4a, 0x34, 0x42,
-        0x91, 0xb3, 0x29, 0x67, 0xf5, 0xf5, 0x3f, 0x7e,
-        0x2e, 0x3e, 0x23, 0x42, 0x2c, 0x62, 0x8d, 0x8f,
-        0x5d, 0x0a, 0xd0, 0x85, 0x8c, 0x0a, 0xe0, 0x73,
-    ]); // FsJ3A3u2vn5cTVofAjvy6y5kwABJAqYWpe4975bi2epH
+    /// Pyth Solana Receiver program ID (same for mainnet and devnet)
+    /// rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ
+    pub const PYTH_RECEIVER_PROGRAM_ID: Pubkey = Pubkey::new_from_array([
+        0x0c, 0xb7, 0xfa, 0xbb, 0x52, 0xf7, 0xa6, 0x48,
+        0xbb, 0x5b, 0x31, 0x7d, 0x9a, 0x01, 0x8b, 0x90,
+        0x57, 0xcb, 0x02, 0x47, 0x74, 0xfa, 0xfe, 0x01,
+        0xe6, 0xc4, 0xdf, 0x98, 0xcc, 0x38, 0x58, 0x81,
+    ]);
 
-    /// Pyth devnet price program ID
-    #[cfg(feature = "devnet")]
-    pub const PYTH_PROGRAM_ID: Pubkey = Pubkey::new_from_array([
-        0x0a, 0x1a, 0x98, 0x33, 0xa3, 0x76, 0x55, 0x2b,
-        0x56, 0xb7, 0xca, 0x0d, 0xed, 0x19, 0x29, 0x17,
-        0x00, 0x57, 0xe8, 0x27, 0xa0, 0xc6, 0x27, 0xf4,
-        0xb6, 0x47, 0xb9, 0xee, 0x90, 0x99, 0xaf, 0xb4,
-    ]); // gSbePebfvPy7tRqimPoVecS2UsBvYv46ynrzWocc92s
+    // PriceUpdateV2 account layout offsets (134 bytes minimum)
+    // See: https://github.com/pyth-network/pyth-crosschain/blob/main/target_chains/solana/pyth_solana_receiver_sdk/src/price_update.rs
+    const PRICE_UPDATE_V2_MIN_LEN: usize = 134;
+    const OFF_FEED_ID: usize = 42;      // 32 bytes
+    const OFF_PRICE: usize = 74;        // i64
+    const OFF_CONF: usize = 82;         // u64
+    const OFF_EXPO: usize = 90;         // i32
+    const OFF_PUBLISH_TIME: usize = 94; // i64
 
-    // Pyth price account constants
-    const PYTH_MAGIC: u32 = 0xa1b2c3d4;
-    const PYTH_VERSION_2: u32 = 2;
-    const PYTH_ACCOUNT_TYPE_PRICE: u32 = 3;
-    const PYTH_STATUS_TRADING: u32 = 1;
-
-    // Maximum supported exponent to prevent overflow (10^38 fits in u128)
+    // Maximum supported exponent to prevent overflow (10^18 fits in u128)
     const MAX_EXPO_ABS: i32 = 18;
 
-    pub fn read_pyth_price_e6(price_ai: &AccountInfo, now_slot: u64, max_staleness: u64, conf_bps: u16) -> Result<u64, ProgramError> {
+    /// Read price from a Pyth PriceUpdateV2 account.
+    ///
+    /// Parameters:
+    /// - price_ai: The PriceUpdateV2 account
+    /// - expected_feed_id: The expected Pyth feed ID (must match account's feed_id)
+    /// - now_unix_ts: Current unix timestamp (from clock.unix_timestamp)
+    /// - max_staleness_secs: Maximum age in seconds
+    /// - conf_bps: Maximum confidence interval in basis points
+    ///
+    /// Returns the price in e6 format (e.g., 150_000_000 = $150.00).
+    pub fn read_pyth_price_e6(
+        price_ai: &AccountInfo,
+        expected_feed_id: &[u8; 32],
+        now_unix_ts: i64,
+        max_staleness_secs: u64,
+        conf_bps: u16,
+    ) -> Result<u64, ProgramError> {
         // Validate oracle owner (skip in tests to allow mock oracles)
         #[cfg(not(feature = "test"))]
         {
-            if *price_ai.owner != PYTH_PROGRAM_ID {
+            if *price_ai.owner != PYTH_RECEIVER_PROGRAM_ID {
                 return Err(ProgramError::IllegalOwner);
             }
         }
 
         let data = price_ai.try_borrow_data()?;
-        if data.len() < 208 {
+        if data.len() < PRICE_UPDATE_V2_MIN_LEN {
             return Err(ProgramError::InvalidAccountData);
         }
 
-        // SECURITY (C2): Validate Pyth account magic, version, and type
-        // This prevents passing non-price Pyth accounts (mapping, product, etc.)
-        #[cfg(not(feature = "test"))]
-        {
-            let magic = u32::from_le_bytes(data[0..4].try_into().unwrap());
-            let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
-            let account_type = u32::from_le_bytes(data[8..12].try_into().unwrap());
-
-            if magic != PYTH_MAGIC {
-                return Err(PercolatorError::OracleInvalid.into());
-            }
-            if version != PYTH_VERSION_2 {
-                return Err(PercolatorError::OracleInvalid.into());
-            }
-            if account_type != PYTH_ACCOUNT_TYPE_PRICE {
-                return Err(PercolatorError::OracleInvalid.into());
-            }
+        // Validate feed_id matches expected
+        let feed_id: [u8; 32] = data[OFF_FEED_ID..OFF_FEED_ID + 32].try_into().unwrap();
+        if &feed_id != expected_feed_id {
+            return Err(PercolatorError::InvalidOracleKey.into());
         }
 
-        let expo = i32::from_le_bytes(data[20..24].try_into().unwrap());
-
-        // SECURITY (C3): Bound exponent to prevent overflow in pow()
-        // Exponents outside [-18, +18] would overflow u128 or produce 0
-        if expo.abs() > MAX_EXPO_ABS {
-            return Err(PercolatorError::OracleInvalid.into());
-        }
-
-        // SECURITY (H4): Validate Pyth trading status
-        // Status 1 = Trading, other values indicate halted/unknown
-        #[cfg(not(feature = "devnet"))]
-        {
-            let status = u32::from_le_bytes(data[136..140].try_into().unwrap());
-            if status != PYTH_STATUS_TRADING {
-                return Err(PercolatorError::OracleInvalid.into());
-            }
-        }
-
-        let price = i64::from_le_bytes(data[176..184].try_into().unwrap());
-        let conf = u64::from_le_bytes(data[184..192].try_into().unwrap());
-        let pub_slot = u64::from_le_bytes(data[200..208].try_into().unwrap());
+        // Read price fields
+        let price = i64::from_le_bytes(data[OFF_PRICE..OFF_PRICE + 8].try_into().unwrap());
+        let conf = u64::from_le_bytes(data[OFF_CONF..OFF_CONF + 8].try_into().unwrap());
+        let expo = i32::from_le_bytes(data[OFF_EXPO..OFF_EXPO + 4].try_into().unwrap());
+        let publish_time = i64::from_le_bytes(data[OFF_PUBLISH_TIME..OFF_PUBLISH_TIME + 8].try_into().unwrap());
 
         if price <= 0 {
             return Err(PercolatorError::OracleInvalid.into());
         }
 
-        // Skip staleness check on devnet since oracles aren't actively updated
+        // SECURITY (C3): Bound exponent to prevent overflow in pow()
+        if expo.abs() > MAX_EXPO_ABS {
+            return Err(PercolatorError::OracleInvalid.into());
+        }
+
+        // Staleness check (skip on devnet)
         #[cfg(not(feature = "devnet"))]
         {
-            let age = now_slot.saturating_sub(pub_slot);
-            if age > max_staleness {
+            let age = now_unix_ts.saturating_sub(publish_time);
+            if age < 0 || age as u64 > max_staleness_secs {
                 return Err(PercolatorError::OracleStale.into());
             }
         }
         #[cfg(feature = "devnet")]
-        let _ = (pub_slot, max_staleness); // Suppress unused warnings
+        let _ = (publish_time, max_staleness_secs, now_unix_ts);
 
+        // Confidence check (skip on devnet)
         let price_u = price as u128;
-        // Skip confidence check on devnet since oracles have unreliable confidence data
         #[cfg(not(feature = "devnet"))]
         {
             let lhs = (conf as u128) * 10_000;
@@ -1502,22 +1497,20 @@ pub mod oracle {
             }
         }
         #[cfg(feature = "devnet")]
-        let _ = (conf, conf_bps); // Suppress unused warnings
+        let _ = (conf, conf_bps);
 
+        // Convert to e6 format
         let scale = expo + 6;
         let final_price_u128 = if scale >= 0 {
-            // SECURITY (C3): Use checked_mul to catch overflow
             let mul = 10u128.pow(scale as u32);
             price_u.checked_mul(mul).ok_or(PercolatorError::EngineOverflow)?
         } else {
-            // SECURITY (C3): Exponent already bounded, so div cannot be 0
-            // (scale >= -18-6 = -24, so pow <= 10^24 which fits u128)
             let div = 10u128.pow((-scale) as u32);
             price_u / div
         };
 
         if final_price_u128 == 0 {
-             return Err(PercolatorError::OracleInvalid.into());
+            return Err(PercolatorError::OracleInvalid.into());
         }
         if final_price_u128 > u64::MAX as u128 {
             return Err(PercolatorError::EngineOverflow.into());
@@ -1531,22 +1524,22 @@ pub mod oracle {
     /// If invert == 0: returns USD_per_SOL_e6 (normal)
     /// If invert != 0: returns SOL_per_USD_e6 = 1e12 / USD_per_SOL_e6 (inverted)
     ///
-    /// The raw oracle is validated (staleness, confidence, status) BEFORE inversion.
+    /// The raw oracle is validated (staleness, confidence) BEFORE inversion.
     pub fn read_engine_price_e6(
         price_ai: &AccountInfo,
-        now_slot: u64,
-        max_staleness: u64,
+        expected_feed_id: &[u8; 32],
+        now_unix_ts: i64,
+        max_staleness_secs: u64,
         conf_bps: u16,
         invert: u8,
     ) -> Result<u64, ProgramError> {
-        let raw_price = read_pyth_price_e6(price_ai, now_slot, max_staleness, conf_bps)?;
+        let raw_price = read_pyth_price_e6(price_ai, expected_feed_id, now_unix_ts, max_staleness_secs, conf_bps)?;
 
         if invert == 0 {
             return Ok(raw_price);
         }
 
         // Invert: SOL_per_USD_e6 = 1e12 / USD_per_SOL_e6
-        // This converts USD/SOL to SOL/USD while maintaining e6 precision
         let inverted = (1_000_000_000_000u128)
             .checked_div(raw_price as u128)
             .ok_or(PercolatorError::OracleInvalid)?;
@@ -1804,10 +1797,12 @@ pub mod processor {
 
         match instruction {
             Instruction::InitMarket {
-                admin, collateral_mint, pyth_index, pyth_collateral,
-                max_staleness_slots, conf_filter_bps, invert, unit_scale, risk_params
+                admin, collateral_mint, index_feed_id,
+                max_staleness_secs, conf_filter_bps, invert, unit_scale, risk_params
             } => {
-                accounts::expect_len(accounts, 11)?;
+                // Reduced from 11 to 9: removed pyth_index and pyth_collateral accounts
+                // (feed_id is now passed in instruction data, not as account)
+                accounts::expect_len(accounts, 9)?;
                 let a_admin = &accounts[0];
                 let a_slab = &accounts[1];
                 let a_mint = &accounts[2];
@@ -1877,9 +1872,9 @@ pub mod processor {
                 let config = MarketConfig {
                     collateral_mint: a_mint.key.to_bytes(),
                     vault_pubkey: a_vault.key.to_bytes(),
-                    collateral_oracle: pyth_collateral.to_bytes(),
-                    index_oracle: pyth_index.to_bytes(),
-                    max_staleness_slots,
+                    _reserved: [0; 32],
+                    index_feed_id,
+                    max_staleness_secs,
                     conf_filter_bps,
                     vault_authority_bump: bump,
                     invert,
@@ -2048,11 +2043,6 @@ pub mod processor {
                     return Err(PercolatorError::EngineUnauthorized.into());
                 }
 
-                // Oracle key validation via verify helper (Kani-provable)
-                if !crate::verify::oracle_key_ok(config.index_oracle, a_oracle_idx.key.to_bytes()) {
-                    return Err(ProgramError::InvalidArgument);
-                }
-
                 let (derived_pda, _) = accounts::derive_vault_authority(program_id, a_slab.key);
                 accounts::expect_key(a_vault_pda, &derived_pda)?;
 
@@ -2060,11 +2050,12 @@ pub mod processor {
                 verify_token_account(a_user_ata, a_user.key, &mint)?;
 
                 let clock = Clock::from_account_info(a_clock)?;
-                // Use engine price (with inversion if configured)
+                // Read oracle price (feed_id validation done inside)
                 let price = oracle::read_engine_price_e6(
                     a_oracle_idx,
-                    clock.slot,
-                    config.max_staleness_slots,
+                    &config.index_feed_id,
+                    clock.unix_timestamp,
+                    config.max_staleness_secs,
                     config.conf_filter_bps,
                     config.invert,
                 )?;
@@ -2135,11 +2126,6 @@ pub mod processor {
                     }
                 }
 
-                // Oracle key validation via verify helper (Kani-provable)
-                if !crate::verify::oracle_key_ok(config.index_oracle, a_oracle.key.to_bytes()) {
-                    return Err(ProgramError::InvalidArgument);
-                }
-
                 // Read dust before borrowing engine (for dust sweep later)
                 let dust_before = state::read_dust_base(&data);
                 let unit_scale = config.unit_scale;
@@ -2158,11 +2144,12 @@ pub mod processor {
                 }
 
                 let clock = Clock::from_account_info(a_clock)?;
-                // Use engine price (with inversion if configured)
+                // Read oracle price (feed_id validation done inside)
                 let price = oracle::read_engine_price_e6(
                     a_oracle,
-                    clock.slot,
-                    config.max_staleness_slots,
+                    &config.index_feed_id,
+                    clock.unix_timestamp,
+                    config.max_staleness_secs,
                     config.conf_filter_bps,
                     config.invert,
                 )?;
@@ -2282,18 +2269,13 @@ pub mod processor {
                 let clock = Clock::from_account_info(&accounts[3])?;
                 let a_oracle = &accounts[4];
 
-                // Oracle key validation via verify helper (Kani-provable)
-                // SECURITY: Prevents oracle substitution attacks where attacker provides
-                // a different Pyth feed to manipulate trade execution price
-                if !crate::verify::oracle_key_ok(config.index_oracle, a_oracle.key.to_bytes()) {
-                    return Err(ProgramError::InvalidArgument);
-                }
-
-                // Use engine price (with inversion if configured)
+                // Read oracle price (feed_id validation done inside)
+                // SECURITY: Prevents oracle substitution attacks via feed_id check
                 let price = oracle::read_engine_price_e6(
                     a_oracle,
-                    clock.slot,
-                    config.max_staleness_slots,
+                    &config.index_feed_id,
+                    clock.unix_timestamp,
+                    config.max_staleness_secs,
                     config.conf_filter_bps,
                     config.invert,
                 )?;
@@ -2425,17 +2407,13 @@ pub mod processor {
                     return Err(PercolatorError::EngineInvalidMatchingEngine.into());
                 }
 
-                // Oracle key validation via verify helper (Kani-provable)
-                if !crate::verify::oracle_key_ok(config.index_oracle, a_oracle.key.to_bytes()) {
-                    return Err(ProgramError::InvalidArgument);
-                }
-
                 let clock = Clock::from_account_info(a_clock)?;
                 // Use engine price (with inversion if configured)
                 let price = oracle::read_engine_price_e6(
                     a_oracle,
-                    clock.slot,
-                    config.max_staleness_slots,
+                    &config.index_feed_id,
+                    clock.unix_timestamp,
+                    config.max_staleness_secs,
                     config.conf_filter_bps,
                     config.invert,
                 )?;
@@ -2552,11 +2530,6 @@ pub mod processor {
                 require_initialized(&data)?;
                 let config = state::read_config(&data);
 
-                // Oracle key validation via verify helper (Kani-provable)
-                if !crate::verify::oracle_key_ok(config.index_oracle, a_oracle.key.to_bytes()) {
-                    return Err(ProgramError::InvalidArgument);
-                }
-
                 let engine = zc::engine_mut(&mut data)?;
 
                 check_idx(engine, target_idx)?;
@@ -2565,8 +2538,9 @@ pub mod processor {
                 // Use engine price (with inversion if configured)
                 let price = oracle::read_engine_price_e6(
                     a_oracle,
-                    clock.slot,
-                    config.max_staleness_slots,
+                    &config.index_feed_id,
+                    clock.unix_timestamp,
+                    config.max_staleness_secs,
                     config.conf_filter_bps,
                     config.invert,
                 )?;
@@ -2608,11 +2582,6 @@ pub mod processor {
                 verify_token_account(a_user_ata, a_user.key, &mint)?;
                 accounts::expect_key(a_pda, &auth)?;
 
-                // Oracle key validation via verify helper (Kani-provable)
-                if !crate::verify::oracle_key_ok(config.index_oracle, a_oracle.key.to_bytes()) {
-                    return Err(ProgramError::InvalidArgument);
-                }
-
                 let engine = zc::engine_mut(&mut data)?;
 
                 check_idx(engine, user_idx)?;
@@ -2627,8 +2596,9 @@ pub mod processor {
                 // Use engine price (with inversion if configured)
                 let price = oracle::read_engine_price_e6(
                     a_oracle,
-                    clock.slot,
-                    config.max_staleness_slots,
+                    &config.index_feed_id,
+                    clock.unix_timestamp,
+                    config.max_staleness_secs,
                     config.conf_filter_bps,
                     config.invert,
                 )?;

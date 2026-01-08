@@ -40,13 +40,16 @@ const MAX_ACCOUNTS: usize = 64;
 #[cfg(not(feature = "test"))]
 const MAX_ACCOUNTS: usize = 4096;
 
-// Pyth mainnet program ID
-const PYTH_PROGRAM_ID: Pubkey = Pubkey::new_from_array([
-    0x92, 0x6a, 0xb1, 0x3b, 0x47, 0x4a, 0x34, 0x42,
-    0x91, 0xb3, 0x29, 0x67, 0xf5, 0xf5, 0x3f, 0x7e,
-    0x2e, 0x3e, 0x23, 0x42, 0x2c, 0x62, 0x8d, 0x8f,
-    0x5d, 0x0a, 0xd0, 0x85, 0x8c, 0x0a, 0xe0, 0x73,
+// Pyth Receiver program ID (rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ)
+const PYTH_RECEIVER_PROGRAM_ID: Pubkey = Pubkey::new_from_array([
+    0x0c, 0xb7, 0xfa, 0xbb, 0x52, 0xf7, 0xa6, 0x48,
+    0xbb, 0x5b, 0x31, 0x7d, 0x9a, 0x01, 0x8b, 0x90,
+    0x57, 0xcb, 0x02, 0x47, 0x74, 0xfa, 0xfe, 0x01,
+    0xe6, 0xc4, 0xdf, 0x98, 0xcc, 0x38, 0x58, 0x81,
 ]);
+
+/// Default feed_id for CU benchmarks
+const BENCHMARK_FEED_ID: [u8; 32] = [0xABu8; 32];
 
 fn program_path() -> PathBuf {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -79,20 +82,21 @@ fn make_mint_data() -> Vec<u8> {
     data
 }
 
-fn make_pyth_data(price: i64, expo: i32, conf: u64, pub_slot: u64) -> Vec<u8> {
-    let mut data = vec![0u8; 208];
-    // Pyth magic: 0xa1b2c3d4
-    data[0..4].copy_from_slice(&0xa1b2c3d4u32.to_le_bytes());
-    // Pyth version: 2
-    data[4..8].copy_from_slice(&2u32.to_le_bytes());
-    // Pyth account type: 3 (Price)
-    data[8..12].copy_from_slice(&3u32.to_le_bytes());
-    data[20..24].copy_from_slice(&expo.to_le_bytes());
-    // Status: 1 (Trading)
-    data[136..140].copy_from_slice(&1u32.to_le_bytes());
-    data[176..184].copy_from_slice(&price.to_le_bytes());
-    data[184..192].copy_from_slice(&conf.to_le_bytes());
-    data[200..208].copy_from_slice(&pub_slot.to_le_bytes());
+/// Create PriceUpdateV2 mock data (Pyth Pull format)
+/// Layout: discriminator(8) + write_authority(32) + verification_level(2) + feed_id(32) +
+///         price(8) + conf(8) + expo(4) + publish_time(8) + ...
+fn make_pyth_data(feed_id: &[u8; 32], price: i64, expo: i32, conf: u64, publish_time: i64) -> Vec<u8> {
+    let mut data = vec![0u8; 134];
+    // feed_id at offset 42
+    data[42..74].copy_from_slice(feed_id);
+    // price at offset 74
+    data[74..82].copy_from_slice(&price.to_le_bytes());
+    // conf at offset 82
+    data[82..90].copy_from_slice(&conf.to_le_bytes());
+    // expo at offset 90
+    data[90..94].copy_from_slice(&expo.to_le_bytes());
+    // publish_time at offset 94
+    data[94..102].copy_from_slice(&publish_time.to_le_bytes());
     data
 }
 
@@ -100,17 +104,15 @@ fn make_pyth_data(price: i64, expo: i32, conf: u64, pub_slot: u64) -> Vec<u8> {
 fn encode_init_market_with_params(
     admin: &Pubkey,
     mint: &Pubkey,
-    pyth_index: &Pubkey,
-    pyth_col: &Pubkey,
+    feed_id: &[u8; 32],
     risk_reduction_threshold: u128,
     warmup_period_slots: u64,
 ) -> Vec<u8> {
     let mut data = vec![0u8];
     data.extend_from_slice(admin.as_ref());
     data.extend_from_slice(mint.as_ref());
-    data.extend_from_slice(pyth_index.as_ref());
-    data.extend_from_slice(pyth_col.as_ref());
-    data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_staleness_slots
+    data.extend_from_slice(feed_id);
+    data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_staleness_secs
     data.extend_from_slice(&500u16.to_le_bytes()); // conf_filter_bps
     data.push(0u8); // invert (0 = no inversion)
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale (0 = no scaling)
@@ -131,8 +133,8 @@ fn encode_init_market_with_params(
     data
 }
 
-fn encode_init_market(admin: &Pubkey, mint: &Pubkey, pyth_index: &Pubkey, pyth_col: &Pubkey) -> Vec<u8> {
-    encode_init_market_with_params(admin, mint, pyth_index, pyth_col, 0, 0)
+fn encode_init_market(admin: &Pubkey, mint: &Pubkey, feed_id: &[u8; 32]) -> Vec<u8> {
+    encode_init_market_with_params(admin, mint, feed_id, 0, 0)
 }
 
 fn encode_init_user(fee: u64) -> Vec<u8> {
@@ -228,23 +230,23 @@ impl TestEnv {
             rent_epoch: 0,
         }).unwrap();
 
-        let pyth_data = make_pyth_data(100_000_000, -6, 1, 100); // $100
+        let pyth_data = make_pyth_data(&BENCHMARK_FEED_ID, 100_000_000, -6, 1, 100); // $100
         svm.set_account(pyth_index, Account {
             lamports: 1_000_000,
             data: pyth_data.clone(),
-            owner: PYTH_PROGRAM_ID,
+            owner: PYTH_RECEIVER_PROGRAM_ID,
             executable: false,
             rent_epoch: 0,
         }).unwrap();
         svm.set_account(pyth_col, Account {
             lamports: 1_000_000,
             data: pyth_data,
-            owner: PYTH_PROGRAM_ID,
+            owner: PYTH_RECEIVER_PROGRAM_ID,
             executable: false,
             rent_epoch: 0,
         }).unwrap();
 
-        svm.set_sysvar(&Clock { slot: 100, ..Clock::default() });
+        svm.set_sysvar(&Clock { slot: 100, unix_timestamp: 100, ..Clock::default() });
 
         TestEnv { svm, program_id, payer, slab, mint, vault, pyth_index, pyth_col }
     }
@@ -264,6 +266,7 @@ impl TestEnv {
             rent_epoch: 0,
         }).unwrap();
 
+        // InitMarket now expects 9 accounts (removed pyth_index and pyth_col)
         let ix = Instruction {
             program_id: self.program_id,
             accounts: vec![
@@ -272,18 +275,15 @@ impl TestEnv {
                 AccountMeta::new_readonly(self.mint, false),
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(sysvar::clock::ID, false),
+                AccountMeta::new_readonly(sysvar::rent::ID, false),
                 AccountMeta::new_readonly(dummy_ata, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-                AccountMeta::new_readonly(sysvar::rent::ID, false),
-                AccountMeta::new_readonly(self.pyth_index, false),
-                AccountMeta::new_readonly(self.pyth_col, false),
-                AccountMeta::new_readonly(sysvar::clock::ID, false),
             ],
             data: encode_init_market_with_params(
                 &admin.pubkey(),
                 &self.mint,
-                &self.pyth_index,
-                &self.pyth_col,
+                &BENCHMARK_FEED_ID,
                 risk_reduction_threshold,
                 warmup_period_slots,
             ),
@@ -435,20 +435,21 @@ impl TestEnv {
     }
 
     fn set_price(&mut self, price_e6: i64, slot: u64) {
-        self.svm.set_sysvar(&Clock { slot, ..Clock::default() });
-        let pyth_data = make_pyth_data(price_e6, -6, 1, slot);
+        // Set both slot and unix_timestamp (using slot value as unix_timestamp for simplicity)
+        self.svm.set_sysvar(&Clock { slot, unix_timestamp: slot as i64, ..Clock::default() });
+        let pyth_data = make_pyth_data(&BENCHMARK_FEED_ID, price_e6, -6, 1, slot as i64);
 
         self.svm.set_account(self.pyth_index, Account {
             lamports: 1_000_000,
             data: pyth_data.clone(),
-            owner: PYTH_PROGRAM_ID,
+            owner: PYTH_RECEIVER_PROGRAM_ID,
             executable: false,
             rent_epoch: 0,
         }).unwrap();
         self.svm.set_account(self.pyth_col, Account {
             lamports: 1_000_000,
             data: pyth_data,
-            owner: PYTH_PROGRAM_ID,
+            owner: PYTH_RECEIVER_PROGRAM_ID,
             executable: false,
             rent_epoch: 0,
         }).unwrap();

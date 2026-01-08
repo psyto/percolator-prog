@@ -29,7 +29,7 @@ use percolator_prog::verify::{
     gate_active, nonce_on_success, nonce_on_failure, pda_key_matches, cpi_trade_size,
     // Account validation helpers
     signer_ok, writable_ok, len_ok,
-    LpPdaShape, lp_pda_shape_ok, oracle_key_ok,
+    LpPdaShape, lp_pda_shape_ok, oracle_feed_id_ok,
     SlabShape, slab_shape_ok,
     // Decision helpers for program-level coupling proofs
     single_owner_authorized, trade_authorized,
@@ -1219,23 +1219,23 @@ fn kani_lp_pda_rejects_funded() {
 }
 
 // =============================================================================
-// S. ORACLE KEY AND SLAB SHAPE (4 proofs)
+// S. ORACLE FEED_ID AND SLAB SHAPE (4 proofs)
 // =============================================================================
 
-/// Prove: oracle_key_ok accepts matching keys
+/// Prove: oracle_feed_id_ok accepts matching feed_ids
 #[kani::proof]
-fn kani_oracle_key_match() {
-    let key: [u8; 32] = kani::any();
-    assert!(oracle_key_ok(key, key), "matching oracle keys must be accepted");
+fn kani_oracle_feed_id_match() {
+    let feed_id: [u8; 32] = kani::any();
+    assert!(oracle_feed_id_ok(feed_id, feed_id), "matching oracle feed_ids must be accepted");
 }
 
-/// Prove: oracle_key_ok rejects mismatched keys
+/// Prove: oracle_feed_id_ok rejects mismatched feed_ids
 #[kani::proof]
-fn kani_oracle_key_mismatch() {
+fn kani_oracle_feed_id_mismatch() {
     let expected: [u8; 32] = kani::any();
     let provided: [u8; 32] = kani::any();
     kani::assume(expected != provided);
-    assert!(!oracle_key_ok(expected, provided), "mismatched oracle keys must be rejected");
+    assert!(!oracle_feed_id_ok(expected, provided), "mismatched oracle feed_ids must be rejected");
 }
 
 /// Prove: valid slab shape is accepted

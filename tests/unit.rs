@@ -68,19 +68,34 @@ fn make_token_account(mint: Pubkey, owner: Pubkey, amount: u64) -> Vec<u8> {
     data
 }
 
-fn make_pyth(price: i64, expo: i32, conf: u64, pub_slot: u64) -> Vec<u8> {
-    let mut data = vec![0u8; 208];
-    data[20..24].copy_from_slice(&expo.to_le_bytes());
-    // Set status = 1 (TRADING) at offset 136
-    data[136..140].copy_from_slice(&1u32.to_le_bytes());
-    data[176..184].copy_from_slice(&price.to_le_bytes());
-    data[184..192].copy_from_slice(&conf.to_le_bytes());
-    data[200..208].copy_from_slice(&pub_slot.to_le_bytes());
+/// PYTH_RECEIVER_PROGRAM_ID bytes (rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ)
+const PYTH_RECEIVER_BYTES: [u8; 32] = [
+    0x0c, 0xb7, 0xfa, 0xbb, 0x52, 0xf7, 0xa6, 0x48,
+    0xbb, 0x5b, 0x31, 0x7d, 0x9a, 0x01, 0x8b, 0x90,
+    0x57, 0xcb, 0x02, 0x47, 0x74, 0xfa, 0xfe, 0x01,
+    0xe6, 0xc4, 0xdf, 0x98, 0xcc, 0x38, 0x58, 0x81,
+];
+
+/// Create PriceUpdateV2 mock data (Pyth Pull format)
+/// Layout: discriminator(8) + write_authority(32) + verification_level(2) + feed_id(32) +
+///         price(8) + conf(8) + expo(4) + publish_time(8) + ...
+fn make_pyth(feed_id: &[u8; 32], price: i64, expo: i32, conf: u64, publish_time: i64) -> Vec<u8> {
+    let mut data = vec![0u8; 134];
+    // feed_id at offset 42
+    data[42..74].copy_from_slice(feed_id);
+    // price at offset 74
+    data[74..82].copy_from_slice(&price.to_le_bytes());
+    // conf at offset 82
+    data[82..90].copy_from_slice(&conf.to_le_bytes());
+    // expo at offset 90
+    data[90..94].copy_from_slice(&expo.to_le_bytes());
+    // publish_time at offset 94
+    data[94..102].copy_from_slice(&publish_time.to_le_bytes());
     data
 }
 
-fn make_clock(slot: u64) -> Vec<u8> {
-    let clock = Clock { slot, ..Clock::default() };
+fn make_clock(slot: u64, unix_timestamp: i64) -> Vec<u8> {
+    let clock = Clock { slot, unix_timestamp, ..Clock::default() };
     bincode::serialize(&clock).unwrap()
 }
 
@@ -92,99 +107,103 @@ struct MarketFixture {
     vault: TestAccount,
     token_prog: TestAccount,
     pyth_index: TestAccount,
-    pyth_col: TestAccount,
+    index_feed_id: [u8; 32],
     clock: TestAccount,
     rent: TestAccount,
     system: TestAccount,
     vault_pda: Pubkey,
 }
-    fn setup_market() -> MarketFixture {
-        let program_id = Pubkey::new_unique();
-        let slab_key = Pubkey::new_unique();
-        let (vault_pda, _) = Pubkey::find_program_address(&[b"vault", slab_key.as_ref()], &program_id);
-        let mint_key = Pubkey::new_unique();
 
-        // Price = $100 (100_000_000 in e6 format), expo = -6, conf = 1, pub_slot = 100
-        let pyth_data = make_pyth(100_000_000, -6, 1, 100);
+/// Default feed_id for tests
+const TEST_FEED_ID: [u8; 32] = [0xABu8; 32];
 
-        MarketFixture {
-            program_id,
-            admin: TestAccount::new(Pubkey::new_unique(), solana_program::system_program::id(), 0, vec![]).signer(),
-            slab: TestAccount::new(slab_key, program_id, 0, vec![0u8; percolator_prog::constants::SLAB_LEN]).writable(),
-            mint: TestAccount::new(mint_key, solana_program::system_program::id(), 0, vec![]),
-            vault: TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0, make_token_account(mint_key, vault_pda, 0)).writable(),
-            token_prog: TestAccount::new(spl_token::ID, Pubkey::default(), 0, vec![]),
-            pyth_index: TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, pyth_data.clone()),
-            pyth_col: TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, pyth_data),
-            clock: TestAccount::new(solana_program::sysvar::clock::id(), solana_program::sysvar::id(), 0, make_clock(100)),
-            rent: TestAccount::new(solana_program::sysvar::rent::id(), solana_program::sysvar::id(), 0, vec![]),
-            system: TestAccount::new(solana_program::system_program::id(), Pubkey::default(), 0, vec![]),
-            vault_pda,
-        }
+fn setup_market() -> MarketFixture {
+    let program_id = Pubkey::new_unique();
+    let slab_key = Pubkey::new_unique();
+    let (vault_pda, _) = Pubkey::find_program_address(&[b"vault", slab_key.as_ref()], &program_id);
+    let mint_key = Pubkey::new_unique();
+    let pyth_receiver_id = Pubkey::new_from_array(PYTH_RECEIVER_BYTES);
+
+    // Price = $100 (100_000_000 in e6 format), expo = -6, conf = 1, publish_time = 100
+    let pyth_data = make_pyth(&TEST_FEED_ID, 100_000_000, -6, 1, 100);
+
+    MarketFixture {
+        program_id,
+        admin: TestAccount::new(Pubkey::new_unique(), solana_program::system_program::id(), 0, vec![]).signer(),
+        slab: TestAccount::new(slab_key, program_id, 0, vec![0u8; percolator_prog::constants::SLAB_LEN]).writable(),
+        mint: TestAccount::new(mint_key, solana_program::system_program::id(), 0, vec![]),
+        vault: TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0, make_token_account(mint_key, vault_pda, 0)).writable(),
+        token_prog: TestAccount::new(spl_token::ID, Pubkey::default(), 0, vec![]),
+        pyth_index: TestAccount::new(Pubkey::new_unique(), pyth_receiver_id, 0, pyth_data),
+        index_feed_id: TEST_FEED_ID,
+        clock: TestAccount::new(solana_program::sysvar::clock::id(), solana_program::sysvar::id(), 0, make_clock(100, 100)),
+        rent: TestAccount::new(solana_program::sysvar::rent::id(), solana_program::sysvar::id(), 0, vec![]),
+        system: TestAccount::new(solana_program::system_program::id(), Pubkey::default(), 0, vec![]),
+        vault_pda,
     }
+}
 
-    // --- Encoders ---
+// --- Encoders ---
 
-    fn encode_u64(val: u64, buf: &mut Vec<u8>) { buf.extend_from_slice(&val.to_le_bytes()); }
-    fn encode_u32(val: u32, buf: &mut Vec<u8>) { buf.extend_from_slice(&val.to_le_bytes()); }
-    fn encode_u16(val: u16, buf: &mut Vec<u8>) { buf.extend_from_slice(&val.to_le_bytes()); }
-    fn encode_i128(val: i128, buf: &mut Vec<u8>) { buf.extend_from_slice(&val.to_le_bytes()); }
-    fn encode_u128(val: u128, buf: &mut Vec<u8>) { buf.extend_from_slice(&val.to_le_bytes()); }
-    fn encode_pubkey(val: &Pubkey, buf: &mut Vec<u8>) { buf.extend_from_slice(val.as_ref()); }
+fn encode_u64(val: u64, buf: &mut Vec<u8>) { buf.extend_from_slice(&val.to_le_bytes()); }
+fn encode_u32(val: u32, buf: &mut Vec<u8>) { buf.extend_from_slice(&val.to_le_bytes()); }
+fn encode_u16(val: u16, buf: &mut Vec<u8>) { buf.extend_from_slice(&val.to_le_bytes()); }
+fn encode_i128(val: i128, buf: &mut Vec<u8>) { buf.extend_from_slice(&val.to_le_bytes()); }
+fn encode_u128(val: u128, buf: &mut Vec<u8>) { buf.extend_from_slice(&val.to_le_bytes()); }
+fn encode_pubkey(val: &Pubkey, buf: &mut Vec<u8>) { buf.extend_from_slice(val.as_ref()); }
+fn encode_bytes32(val: &[u8; 32], buf: &mut Vec<u8>) { buf.extend_from_slice(val); }
 
-    fn encode_init_market(fixture: &MarketFixture, crank_staleness: u64) -> Vec<u8> {
-        let mut data = vec![0u8];
-        encode_pubkey(&fixture.admin.key, &mut data);
-        encode_pubkey(&fixture.mint.key, &mut data);
-        encode_pubkey(&fixture.pyth_index.key, &mut data);
-        encode_pubkey(&fixture.pyth_col.key, &mut data);
-        encode_u64(100, &mut data);
-        encode_u16(500, &mut data);
-        data.push(0u8); // invert (0 = no inversion)
-        encode_u32(0, &mut data); // unit_scale (0 = no scaling)
+fn encode_init_market(fixture: &MarketFixture, crank_staleness: u64) -> Vec<u8> {
+    let mut data = vec![0u8];
+    encode_pubkey(&fixture.admin.key, &mut data);
+    encode_pubkey(&fixture.mint.key, &mut data);
+    encode_bytes32(&fixture.index_feed_id, &mut data);
+    encode_u64(100, &mut data); // max_staleness_secs
+    encode_u16(500, &mut data); // conf_filter_bps
+    data.push(0u8); // invert (0 = no inversion)
+    encode_u32(0, &mut data); // unit_scale (0 = no scaling)
 
-        encode_u64(0, &mut data);
-        encode_u64(0, &mut data);
-        encode_u64(0, &mut data);
-        encode_u64(0, &mut data);
-        encode_u64(64, &mut data);
-        encode_u128(0, &mut data);
-        encode_u128(0, &mut data);
-        encode_u128(0, &mut data);
-        encode_u64(crank_staleness, &mut data);
-        encode_u64(0, &mut data);
-        encode_u128(0, &mut data);
-        encode_u64(0, &mut data);
-        encode_u128(0, &mut data);
-        data
-    }
+    encode_u64(0, &mut data);
+    encode_u64(0, &mut data);
+    encode_u64(0, &mut data);
+    encode_u64(0, &mut data);
+    encode_u64(64, &mut data);
+    encode_u128(0, &mut data);
+    encode_u128(0, &mut data);
+    encode_u128(0, &mut data);
+    encode_u64(crank_staleness, &mut data);
+    encode_u64(0, &mut data);
+    encode_u128(0, &mut data);
+    encode_u64(0, &mut data);
+    encode_u128(0, &mut data);
+    data
+}
 
-    fn encode_init_market_invert(fixture: &MarketFixture, crank_staleness: u64, invert: u8, unit_scale: u32) -> Vec<u8> {
-        let mut data = vec![0u8];
-        encode_pubkey(&fixture.admin.key, &mut data);
-        encode_pubkey(&fixture.mint.key, &mut data);
-        encode_pubkey(&fixture.pyth_index.key, &mut data);
-        encode_pubkey(&fixture.pyth_col.key, &mut data);
-        encode_u64(100, &mut data);
-        encode_u16(500, &mut data);
-        data.push(invert);
-        encode_u32(unit_scale, &mut data);
+fn encode_init_market_invert(fixture: &MarketFixture, crank_staleness: u64, invert: u8, unit_scale: u32) -> Vec<u8> {
+    let mut data = vec![0u8];
+    encode_pubkey(&fixture.admin.key, &mut data);
+    encode_pubkey(&fixture.mint.key, &mut data);
+    encode_bytes32(&fixture.index_feed_id, &mut data);
+    encode_u64(100, &mut data); // max_staleness_secs
+    encode_u16(500, &mut data); // conf_filter_bps
+    data.push(invert);
+    encode_u32(unit_scale, &mut data);
 
-        encode_u64(0, &mut data);
-        encode_u64(0, &mut data);
-        encode_u64(0, &mut data);
-        encode_u64(0, &mut data);
-        encode_u64(64, &mut data);
-        encode_u128(0, &mut data);
-        encode_u128(0, &mut data);
-        encode_u128(0, &mut data);
-        encode_u64(crank_staleness, &mut data);
-        encode_u64(0, &mut data);
-        encode_u128(0, &mut data);
-        encode_u64(0, &mut data);
-        encode_u128(0, &mut data);
-        data
-    }
+    encode_u64(0, &mut data);
+    encode_u64(0, &mut data);
+    encode_u64(0, &mut data);
+    encode_u64(0, &mut data);
+    encode_u64(64, &mut data);
+    encode_u128(0, &mut data);
+    encode_u128(0, &mut data);
+    encode_u128(0, &mut data);
+    encode_u64(crank_staleness, &mut data);
+    encode_u64(0, &mut data);
+    encode_u128(0, &mut data);
+    encode_u64(0, &mut data);
+    encode_u128(0, &mut data);
+    data
+}
 
     fn encode_init_user(fee: u64) -> Vec<u8> {
         let mut data = vec![1u8];
@@ -312,7 +331,7 @@ struct MarketFixture {
             let mut dummy_ata = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
             let accounts = vec![
                 f.admin.to_info(), f.slab.to_info(), f.mint.to_info(), f.vault.to_info(), f.token_prog.to_info(),
-                dummy_ata.to_info(), f.system.to_info(), f.rent.to_info(), f.pyth_index.to_info(), f.pyth_col.to_info(), f.clock.to_info(),
+                f.clock.to_info(), f.rent.to_info(), dummy_ata.to_info(), f.system.to_info(),
             ];
             process_instruction(&f.program_id, &accounts, &data).unwrap();
         }
@@ -333,8 +352,7 @@ struct MarketFixture {
             let mut dummy_ata = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
             let init_accounts = vec![
                 f.admin.to_info(), f.slab.to_info(), f.mint.to_info(), f.vault.to_info(),
-                f.token_prog.to_info(), dummy_ata.to_info(),
-                f.system.to_info(), f.rent.to_info(), f.pyth_index.to_info(), f.pyth_col.to_info(), f.clock.to_info()
+                f.token_prog.to_info(), f.clock.to_info(), f.rent.to_info(), dummy_ata.to_info(), f.system.to_info(),
             ];
             process_instruction(&f.program_id, &init_accounts, &init_data).unwrap();
         }
@@ -363,8 +381,7 @@ struct MarketFixture {
             let mut dummy_ata = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
             let init_accounts = vec![
                 f.admin.to_info(), f.slab.to_info(), f.mint.to_info(), f.vault.to_info(),
-                f.token_prog.to_info(), dummy_ata.to_info(),
-                f.system.to_info(), f.rent.to_info(), f.pyth_index.to_info(), f.pyth_col.to_info(), f.clock.to_info()
+                f.token_prog.to_info(), f.clock.to_info(), f.rent.to_info(), dummy_ata.to_info(), f.system.to_info(),
             ];
             process_instruction(&f.program_id, &init_accounts, &init_data).unwrap();
         }
@@ -414,8 +431,7 @@ struct MarketFixture {
         let mut dummy_ata = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
         let init_accounts = vec![
             f.admin.to_info(), f.slab.to_info(), f.mint.to_info(), f.vault.to_info(),
-            f.token_prog.to_info(), dummy_ata.to_info(),
-            f.system.to_info(), f.rent.to_info(), f.pyth_index.to_info(), f.pyth_col.to_info(), f.clock.to_info()
+            f.token_prog.to_info(), f.clock.to_info(), f.rent.to_info(), dummy_ata.to_info(), f.system.to_info(),
         ];
         let res = process_instruction(&f.program_id, &init_accounts, &init_data);
         assert_eq!(res, Err(PercolatorError::InvalidVaultAta.into()));
@@ -429,8 +445,7 @@ struct MarketFixture {
             let mut dummy_ata = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
             let init_accounts = vec![
                 f.admin.to_info(), f.slab.to_info(), f.mint.to_info(), f.vault.to_info(),
-                f.token_prog.to_info(), dummy_ata.to_info(),
-                f.system.to_info(), f.rent.to_info(), f.pyth_index.to_info(), f.pyth_col.to_info(), f.clock.to_info()
+                f.token_prog.to_info(), f.clock.to_info(), f.rent.to_info(), dummy_ata.to_info(), f.system.to_info(),
             ];
             process_instruction(&f.program_id, &init_accounts, &init_data).unwrap();
         }
@@ -483,7 +498,7 @@ struct MarketFixture {
             let mut dummy = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
             let accs = vec![
                 f.admin.to_info(), f.slab.to_info(), f.mint.to_info(), f.vault.to_info(), f.token_prog.to_info(),
-                dummy.to_info(), f.system.to_info(), f.rent.to_info(), f.pyth_index.to_info(), f.pyth_col.to_info(), f.clock.to_info()
+                f.clock.to_info(), f.rent.to_info(), dummy.to_info(), f.system.to_info(),
             ];
             process_instruction(&f.program_id, &accs, &init_data).unwrap();
         }
@@ -534,7 +549,7 @@ struct MarketFixture {
             let mut dummy = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
             let accs = vec![
                 f.admin.to_info(), f.slab.to_info(), f.mint.to_info(), f.vault.to_info(), f.token_prog.to_info(),
-                dummy.to_info(), f.system.to_info(), f.rent.to_info(), f.pyth_index.to_info(), f.pyth_col.to_info(), f.clock.to_info()
+                f.clock.to_info(), f.rent.to_info(), dummy.to_info(), f.system.to_info(),
             ];
             process_instruction(&f.program_id, &accs, &init_data).unwrap();
         }
@@ -596,7 +611,7 @@ struct MarketFixture {
             let mut dummy = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
             let accs = vec![
                 f.admin.to_info(), f.slab.to_info(), f.mint.to_info(), f.vault.to_info(), f.token_prog.to_info(),
-                dummy.to_info(), f.system.to_info(), f.rent.to_info(), f.pyth_index.to_info(), f.pyth_col.to_info(), f.clock.to_info(),
+                f.clock.to_info(), f.rent.to_info(), dummy.to_info(), f.system.to_info(),
             ];
             process_instruction(&f.program_id, &accs, &init_data).unwrap();
         }
@@ -652,7 +667,7 @@ struct MarketFixture {
             let mut dummy = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
             let accs = vec![
                 f.admin.to_info(), f.slab.to_info(), f.mint.to_info(), f.vault.to_info(), f.token_prog.to_info(),
-                dummy.to_info(), f.system.to_info(), f.rent.to_info(), f.pyth_index.to_info(), f.pyth_col.to_info(), f.clock.to_info(),
+                f.clock.to_info(), f.rent.to_info(), dummy.to_info(), f.system.to_info(),
             ];
             process_instruction(&f.program_id, &accs, &init_data).unwrap();
         }
@@ -717,7 +732,7 @@ struct MarketFixture {
             let mut dummy = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
             let accs = vec![
                 f.admin.to_info(), f.slab.to_info(), f.mint.to_info(), f.vault.to_info(), f.token_prog.to_info(),
-                dummy.to_info(), f.system.to_info(), f.rent.to_info(), f.pyth_index.to_info(), f.pyth_col.to_info(), f.clock.to_info(),
+                f.clock.to_info(), f.rent.to_info(), dummy.to_info(), f.system.to_info(),
             ];
             process_instruction(&f.program_id, &accs, &init_data).unwrap();
         }
@@ -748,7 +763,11 @@ struct MarketFixture {
         }
         let lp_idx = find_idx_by_owner(&f.slab.data, lp.key).unwrap();
 
-        let mut wrong_oracle = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![0u8; 208]);
+        // Create oracle with correct owner but wrong feed_id
+        let wrong_feed_id = [0xFFu8; 32];
+        let pyth_receiver_id = Pubkey::new_from_array(PYTH_RECEIVER_BYTES);
+        let wrong_pyth_data = make_pyth(&wrong_feed_id, 100_000_000, -6, 1, 100);
+        let mut wrong_oracle = TestAccount::new(Pubkey::new_unique(), pyth_receiver_id, 0, wrong_pyth_data);
 
         // Create lp_pda account (system-owned, 0 data)
         let lp_bytes = lp_idx.to_le_bytes();
@@ -764,14 +783,15 @@ struct MarketFixture {
                 lp.to_info(), // 1
                 f.slab.to_info(), // 2
                 f.clock.to_info(), // 3
-                wrong_oracle.to_info(), // 4 oracle (WRONG KEY)
+                wrong_oracle.to_info(), // 4 oracle (WRONG FEED_ID)
                 matcher_program.to_info(), // 5 matcher
                 matcher_ctx.to_info(), // 6 context
                 lp_pda.to_info(), // 7 lp_pda
             ];
             process_instruction(&f.program_id, &accs, &encode_trade_cpi(lp_idx, user_idx, 100))
         };
-        assert_eq!(res, Err(ProgramError::InvalidArgument));
+        // Returns InvalidOracleKey because feed_id doesn't match expected
+        assert_eq!(res, Err(PercolatorError::InvalidOracleKey.into()));
     }
 
     #[test]
@@ -782,7 +802,7 @@ struct MarketFixture {
             let mut dummy = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
             let accs = vec![
                 f.admin.to_info(), f.slab.to_info(), f.mint.to_info(), f.vault.to_info(), f.token_prog.to_info(),
-                dummy.to_info(), f.system.to_info(), f.rent.to_info(), f.pyth_index.to_info(), f.pyth_col.to_info(), f.clock.to_info(),
+                f.clock.to_info(), f.rent.to_info(), dummy.to_info(), f.system.to_info(),
             ];
             process_instruction(&f.program_id, &accs, &init_data).unwrap();
         }
@@ -818,7 +838,7 @@ struct MarketFixture {
             let mut dummy = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
             let accs = vec![
                 f.admin.to_info(), f.slab.to_info(), f.mint.to_info(), f.vault.to_info(), f.token_prog.to_info(),
-                dummy.to_info(), f.system.to_info(), f.rent.to_info(), f.pyth_index.to_info(), f.pyth_col.to_info(), f.clock.to_info(),
+                f.clock.to_info(), f.rent.to_info(), dummy.to_info(), f.system.to_info(),
             ];
             process_instruction(&f.program_id, &accs, &init_data).unwrap();
         }
@@ -852,7 +872,7 @@ struct MarketFixture {
             let mut dummy = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
             let accs = vec![
                 f.admin.to_info(), f.slab.to_info(), f.mint.to_info(), f.vault.to_info(), f.token_prog.to_info(),
-                dummy.to_info(), f.system.to_info(), f.rent.to_info(), f.pyth_index.to_info(), f.pyth_col.to_info(), f.clock.to_info(),
+                f.clock.to_info(), f.rent.to_info(), dummy.to_info(), f.system.to_info(),
             ];
             process_instruction(&f.program_id, &accs, &init_data).unwrap();
         }
@@ -948,7 +968,7 @@ struct MarketFixture {
         // Clock slot defaults to 0 in test, but last_thr_slot is also 0,
         // so update won't trigger unless slot >= 0 + THRESH_UPDATE_INTERVAL_SLOTS
         // We need to advance the clock
-        f.clock.data = make_clock(100); // Advance past rate limit
+        f.clock.data = make_clock(100, 100); // Advance past rate limit
         {
             let accs = vec![user.to_info(), f.slab.to_info(), f.clock.to_info(), f.pyth_index.to_info()];
             process_instruction(&f.program_id, &accs, &encode_crank(user_idx, 0)).unwrap();
@@ -1003,8 +1023,7 @@ struct MarketFixture {
             let mut dummy_ata = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
             let accounts = vec![
                 f.admin.to_info(), f.slab.to_info(), f.mint.to_info(), f.vault.to_info(),
-                f.token_prog.to_info(), dummy_ata.to_info(),
-                f.system.to_info(), f.rent.to_info(), f.pyth_index.to_info(), f.pyth_col.to_info(), f.clock.to_info()
+                f.token_prog.to_info(), f.clock.to_info(), f.rent.to_info(), dummy_ata.to_info(), f.system.to_info(),
             ];
             process_instruction(&f.program_id, &accounts, &init_data).unwrap();
         }
@@ -1043,8 +1062,7 @@ struct MarketFixture {
             let mut dummy_ata = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
             let accounts = vec![
                 f.admin.to_info(), f.slab.to_info(), f.mint.to_info(), f.vault.to_info(),
-                f.token_prog.to_info(), dummy_ata.to_info(),
-                f.system.to_info(), f.rent.to_info(), f.pyth_index.to_info(), f.pyth_col.to_info(), f.clock.to_info()
+                f.token_prog.to_info(), f.clock.to_info(), f.rent.to_info(), dummy_ata.to_info(), f.system.to_info(),
             ];
             process_instruction(&f.program_id, &accounts, &init_data).unwrap();
         }
@@ -1136,8 +1154,7 @@ struct MarketFixture {
             let mut dummy_ata = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
             let accounts = vec![
                 f.admin.to_info(), f.slab.to_info(), f.mint.to_info(), f.vault.to_info(),
-                f.token_prog.to_info(), dummy_ata.to_info(),
-                f.system.to_info(), f.rent.to_info(), f.pyth_index.to_info(), f.pyth_col.to_info(), f.clock.to_info()
+                f.token_prog.to_info(), f.clock.to_info(), f.rent.to_info(), dummy_ata.to_info(), f.system.to_info(),
             ];
             process_instruction(&f.program_id, &accounts, &init_data).unwrap();
         }
@@ -1213,7 +1230,7 @@ struct MarketFixture {
             "Multiple same-slot cranks must not accumulate funding changes");
 
         // Verify last_funding_slot advances when slot changes (relative check, not absolute)
-        f.clock.data = make_clock(101);
+        f.clock.data = make_clock(101, 101);
         {
             let accs = vec![
                 keeper.to_info(), f.slab.to_info(), f.clock.to_info(), f.pyth_index.to_info(),
@@ -1276,8 +1293,7 @@ struct MarketFixture {
             let mut dummy_ata = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
             let accounts = vec![
                 f.admin.to_info(), f.slab.to_info(), f.mint.to_info(), f.vault.to_info(),
-                f.token_prog.to_info(), dummy_ata.to_info(),
-                f.system.to_info(), f.rent.to_info(), f.pyth_index.to_info(), f.pyth_col.to_info(), f.clock.to_info()
+                f.token_prog.to_info(), f.clock.to_info(), f.rent.to_info(), dummy_ata.to_info(), f.system.to_info(),
             ];
             process_instruction(&f.program_id, &accounts, &init_data).unwrap();
         }
@@ -1324,8 +1340,7 @@ struct MarketFixture {
             let mut dummy_ata = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
             let accounts = vec![
                 f.admin.to_info(), f.slab.to_info(), f.mint.to_info(), f.vault.to_info(),
-                f.token_prog.to_info(), dummy_ata.to_info(),
-                f.system.to_info(), f.rent.to_info(), f.pyth_index.to_info(), f.pyth_col.to_info(), f.clock.to_info()
+                f.token_prog.to_info(), f.clock.to_info(), f.rent.to_info(), dummy_ata.to_info(), f.system.to_info(),
             ];
             process_instruction(&f.program_id, &accounts, &init_data).unwrap();
         }
@@ -1356,8 +1371,7 @@ struct MarketFixture {
             let mut dummy_ata = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
             let accounts = vec![
                 f.admin.to_info(), f.slab.to_info(), f.mint.to_info(), f.vault.to_info(),
-                f.token_prog.to_info(), dummy_ata.to_info(),
-                f.system.to_info(), f.rent.to_info(), f.pyth_index.to_info(), f.pyth_col.to_info(), f.clock.to_info()
+                f.token_prog.to_info(), f.clock.to_info(), f.rent.to_info(), dummy_ata.to_info(), f.system.to_info(),
             ];
             process_instruction(&f.program_id, &accounts, &init_data).unwrap();
         }
@@ -1384,8 +1398,7 @@ struct MarketFixture {
             let mut dummy_ata = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
             let accounts = vec![
                 f.admin.to_info(), f.slab.to_info(), f.mint.to_info(), f.vault.to_info(),
-                f.token_prog.to_info(), dummy_ata.to_info(),
-                f.system.to_info(), f.rent.to_info(), f.pyth_index.to_info(), f.pyth_col.to_info(), f.clock.to_info()
+                f.token_prog.to_info(), f.clock.to_info(), f.rent.to_info(), dummy_ata.to_info(), f.system.to_info(),
             ];
             process_instruction(&f.program_id, &accounts, &init_data).unwrap();
         }
@@ -1429,15 +1442,19 @@ struct MarketFixture {
         // Inverted: 1e12 / 100_000_000 = 10_000 e6 (= $0.01 or 0.01 SOL/USD)
         use percolator_prog::oracle::read_engine_price_e6;
 
-        let pyth_data = make_pyth(100_000_000, -6, 1, 100);
-        let mut oracle = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, pyth_data);
+        let feed_id = [0xCDu8; 32];
+        let pyth_receiver_id = Pubkey::new_from_array(PYTH_RECEIVER_BYTES);
+        // Price = $100, expo = -6, conf = 1, publish_time = 100
+        let pyth_data = make_pyth(&feed_id, 100_000_000, -6, 1, 100);
+        let mut oracle = TestAccount::new(Pubkey::new_unique(), pyth_receiver_id, 0, pyth_data);
 
         // Without inversion (invert=0)
-        let price_raw = read_engine_price_e6(&oracle.to_info(), 100, 100, 500, 0).unwrap();
+        // read_engine_price_e6(ai, feed_id, unix_ts, max_staleness_secs, conf_bps, invert)
+        let price_raw = read_engine_price_e6(&oracle.to_info(), &feed_id, 100, 100, 500, 0).unwrap();
         assert_eq!(price_raw, 100_000_000, "Raw price should be $100 (100_000_000 e6)");
 
         // With inversion (invert=1)
-        let price_inv = read_engine_price_e6(&oracle.to_info(), 100, 100, 500, 1).unwrap();
+        let price_inv = read_engine_price_e6(&oracle.to_info(), &feed_id, 100, 100, 500, 1).unwrap();
         assert_eq!(price_inv, 10_000, "Inverted price should be 10_000 e6 (= 1e12 / 100_000_000)");
     }
 
@@ -1470,7 +1487,7 @@ struct MarketFixture {
             let mut dummy_ata = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
             let accounts = vec![
                 f.admin.to_info(), f.slab.to_info(), f.mint.to_info(), f.vault.to_info(), f.token_prog.to_info(),
-                dummy_ata.to_info(), f.system.to_info(), f.rent.to_info(), f.pyth_index.to_info(), f.pyth_col.to_info(), f.clock.to_info(),
+                f.clock.to_info(), f.rent.to_info(), dummy_ata.to_info(), f.system.to_info(),
             ];
             process_instruction(&f.program_id, &accounts, &data).unwrap();
         }
@@ -1491,7 +1508,7 @@ struct MarketFixture {
             let mut dummy_ata = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
             let accounts = vec![
                 f.admin.to_info(), f.slab.to_info(), f.mint.to_info(), f.vault.to_info(), f.token_prog.to_info(),
-                dummy_ata.to_info(), f.system.to_info(), f.rent.to_info(), f.pyth_index.to_info(), f.pyth_col.to_info(), f.clock.to_info(),
+                f.clock.to_info(), f.rent.to_info(), dummy_ata.to_info(), f.system.to_info(),
             ];
             let res = process_instruction(&f.program_id, &accounts, &data);
             assert_eq!(res, Err(ProgramError::InvalidInstructionData), "Should reject unit_scale > 1B");
@@ -1509,7 +1526,7 @@ struct MarketFixture {
             let mut dummy_ata = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
             let accounts = vec![
                 f.admin.to_info(), f.slab.to_info(), f.mint.to_info(), f.vault.to_info(), f.token_prog.to_info(),
-                dummy_ata.to_info(), f.system.to_info(), f.rent.to_info(), f.pyth_index.to_info(), f.pyth_col.to_info(), f.clock.to_info(),
+                f.clock.to_info(), f.rent.to_info(), dummy_ata.to_info(), f.system.to_info(),
             ];
             process_instruction(&f.program_id, &accounts, &data).unwrap();
         }
@@ -1590,7 +1607,7 @@ struct MarketFixture {
             let mut dummy_ata = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
             let accounts = vec![
                 f.admin.to_info(), f.slab.to_info(), f.mint.to_info(), f.vault.to_info(), f.token_prog.to_info(),
-                dummy_ata.to_info(), f.system.to_info(), f.rent.to_info(), f.pyth_index.to_info(), f.pyth_col.to_info(), f.clock.to_info(),
+                f.clock.to_info(), f.rent.to_info(), dummy_ata.to_info(), f.system.to_info(),
             ];
             process_instruction(&f.program_id, &accounts, &data).unwrap();
         }
@@ -1667,7 +1684,7 @@ struct MarketFixture {
             let mut dummy_ata = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
             let accounts = vec![
                 f.admin.to_info(), f.slab.to_info(), f.mint.to_info(), f.vault.to_info(), f.token_prog.to_info(),
-                dummy_ata.to_info(), f.system.to_info(), f.rent.to_info(), f.pyth_index.to_info(), f.pyth_col.to_info(), f.clock.to_info(),
+                f.clock.to_info(), f.rent.to_info(), dummy_ata.to_info(), f.system.to_info(),
             ];
             process_instruction(&f.program_id, &accounts, &data).unwrap();
         }
@@ -1738,7 +1755,7 @@ struct MarketFixture {
             let mut dummy_ata = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
             let accounts = vec![
                 f.admin.to_info(), f.slab.to_info(), f.mint.to_info(), f.vault.to_info(), f.token_prog.to_info(),
-                dummy_ata.to_info(), f.system.to_info(), f.rent.to_info(), f.pyth_index.to_info(), f.pyth_col.to_info(), f.clock.to_info(),
+                f.clock.to_info(), f.rent.to_info(), dummy_ata.to_info(), f.system.to_info(),
             ];
             process_instruction(&f.program_id, &accounts, &data).unwrap();
         }
@@ -1813,7 +1830,7 @@ struct MarketFixture {
             let mut dummy_ata = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
             let accounts = vec![
                 f.admin.to_info(), f.slab.to_info(), f.mint.to_info(), f.vault.to_info(), f.token_prog.to_info(),
-                dummy_ata.to_info(), f.system.to_info(), f.rent.to_info(), f.pyth_index.to_info(), f.pyth_col.to_info(), f.clock.to_info(),
+                f.clock.to_info(), f.rent.to_info(), dummy_ata.to_info(), f.system.to_info(),
             ];
             process_instruction(&f.program_id, &accounts, &data).unwrap();
         }
@@ -1904,7 +1921,7 @@ struct MarketFixture {
             let mut dummy_ata = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
             let accounts = vec![
                 f.admin.to_info(), f.slab.to_info(), f.mint.to_info(), f.vault.to_info(), f.token_prog.to_info(),
-                dummy_ata.to_info(), f.system.to_info(), f.rent.to_info(), f.pyth_index.to_info(), f.pyth_col.to_info(), f.clock.to_info(),
+                f.clock.to_info(), f.rent.to_info(), dummy_ata.to_info(), f.system.to_info(),
             ];
             process_instruction(&f.program_id, &accounts, &data).unwrap();
         }
