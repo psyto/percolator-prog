@@ -874,13 +874,17 @@ pub mod ix {
 
     #[derive(Debug)]
     pub enum Instruction {
-        InitMarket { 
-            admin: Pubkey, 
-            collateral_mint: Pubkey, 
+        InitMarket {
+            admin: Pubkey,
+            collateral_mint: Pubkey,
             pyth_index: Pubkey,
             pyth_collateral: Pubkey,
             max_staleness_slots: u64,
             conf_filter_bps: u16,
+            /// If non-zero, invert oracle price (USD/SOL -> SOL/USD)
+            invert: u8,
+            /// Lamports per Unit for boundary conversion (0 = no scaling)
+            unit_scale: u32,
             risk_params: RiskParams,
         },
         InitUser { fee_payment: u64 },
@@ -909,10 +913,12 @@ pub mod ix {
                     let pyth_collateral = read_pubkey(&mut rest)?;
                     let max_staleness_slots = read_u64(&mut rest)?;
                     let conf_filter_bps = read_u16(&mut rest)?;
+                    let invert = read_u8(&mut rest)?;
+                    let unit_scale = read_u32(&mut rest)?;
                     let risk_params = read_risk_params(&mut rest)?;
-                    Ok(Instruction::InitMarket { 
-                        admin, collateral_mint, pyth_index, pyth_collateral, 
-                        max_staleness_slots, conf_filter_bps, risk_params 
+                    Ok(Instruction::InitMarket {
+                        admin, collateral_mint, pyth_index, pyth_collateral,
+                        max_staleness_slots, conf_filter_bps, invert, unit_scale, risk_params
                     })
                 },
                 1 => { // InitUser
@@ -988,6 +994,13 @@ pub mod ix {
         let (bytes, rest) = input.split_at(2);
         *input = rest;
         Ok(u16::from_le_bytes(bytes.try_into().unwrap()))
+    }
+
+    fn read_u32(input: &mut &[u8]) -> Result<u32, ProgramError> {
+        if input.len() < 4 { return Err(ProgramError::InvalidInstructionData); }
+        let (bytes, rest) = input.split_at(4);
+        *input = rest;
+        Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
     }
 
     fn read_u64(input: &mut &[u8]) -> Result<u64, ProgramError> {
@@ -1103,7 +1116,7 @@ pub mod state {
         pub bump: u8,
         pub _padding: [u8; 3],
         pub admin: [u8; 32],
-        pub _reserved: [u8; 24], // [0..8]=nonce, [8..16]=last_thr_slot, [16..24]=unused
+        pub _reserved: [u8; 24], // [0..8]=nonce, [8..16]=last_thr_slot, [16..24]=dust_base
     }
 
     /// Offset of _reserved field in SlabHeader, derived from offset_of! for correctness.
@@ -1122,7 +1135,11 @@ pub mod state {
         pub max_staleness_slots: u64,
         pub conf_filter_bps: u16,
         pub vault_authority_bump: u8,
-        pub _padding: [u8; 5],
+        /// If non-zero, invert the oracle price (USD_per_SOL -> SOL_per_USD)
+        pub invert: u8,
+        /// Lamports per Unit for conversion (e.g., 1000 means 1 SOL = 1,000,000 Units)
+        /// If 0, no scaling is applied (1:1 lamports to units)
+        pub unit_scale: u32,
     }
 
     pub fn slab_data_mut<'a, 'b>(ai: &'b AccountInfo<'a>) -> Result<RefMut<'b, &'a mut [u8]>, ProgramError> {
@@ -1168,6 +1185,16 @@ pub mod state {
         data[RESERVED_OFF + 8..RESERVED_OFF + 16].copy_from_slice(&slot.to_le_bytes());
     }
 
+    /// Read accumulated dust (base token remainder) from _reserved[16..24].
+    pub fn read_dust_base(data: &[u8]) -> u64 {
+        u64::from_le_bytes(data[RESERVED_OFF + 16..RESERVED_OFF + 24].try_into().unwrap())
+    }
+
+    /// Write accumulated dust (base token remainder) to _reserved[16..24].
+    pub fn write_dust_base(data: &mut [u8], dust: u64) {
+        data[RESERVED_OFF + 16..RESERVED_OFF + 24].copy_from_slice(&dust.to_le_bytes());
+    }
+
     pub fn read_config(data: &[u8]) -> MarketConfig {
         let mut c = MarketConfig::zeroed();
         let src = &data[HEADER_LEN..HEADER_LEN + CONFIG_LEN];
@@ -1183,7 +1210,42 @@ pub mod state {
     }
 }
 
-// 7. mod oracle
+// 7. mod units - base token/units conversion at instruction boundaries
+pub mod units {
+    /// Convert base token amount to units, returning (units, dust).
+    /// Base token is the collateral (e.g., lamports for SOL, satoshis for BTC).
+    /// If scale is 0, returns (base, 0) - no scaling.
+    #[inline]
+    pub fn base_to_units(base: u64, scale: u32) -> (u64, u64) {
+        if scale == 0 {
+            return (base, 0);
+        }
+        let s = scale as u64;
+        (base / s, base % s)
+    }
+
+    /// Convert units to base token amount.
+    /// If scale is 0, returns units unchanged - no scaling.
+    #[inline]
+    pub fn units_to_base(units: u64, scale: u32) -> u64 {
+        if scale == 0 {
+            return units;
+        }
+        units.saturating_mul(scale as u64)
+    }
+
+    /// Convert units to base token amount with overflow check.
+    /// Returns None if overflow would occur.
+    #[inline]
+    pub fn units_to_base_checked(units: u64, scale: u32) -> Option<u64> {
+        if scale == 0 {
+            return Some(units);
+        }
+        units.checked_mul(scale as u64)
+    }
+}
+
+// 8. mod oracle
 pub mod oracle {
     use solana_program::{account_info::AccountInfo, program_error::ProgramError, pubkey::Pubkey};
     use crate::error::PercolatorError;
@@ -1327,9 +1389,44 @@ pub mod oracle {
 
         Ok(final_price_u128 as u64)
     }
+
+    /// Read oracle price for engine use, applying inversion if configured.
+    ///
+    /// If invert == 0: returns USD_per_SOL_e6 (normal)
+    /// If invert != 0: returns SOL_per_USD_e6 = 1e12 / USD_per_SOL_e6 (inverted)
+    ///
+    /// The raw oracle is validated (staleness, confidence, status) BEFORE inversion.
+    pub fn read_engine_price_e6(
+        price_ai: &AccountInfo,
+        now_slot: u64,
+        max_staleness: u64,
+        conf_bps: u16,
+        invert: u8,
+    ) -> Result<u64, ProgramError> {
+        let raw_price = read_pyth_price_e6(price_ai, now_slot, max_staleness, conf_bps)?;
+
+        if invert == 0 {
+            return Ok(raw_price);
+        }
+
+        // Invert: SOL_per_USD_e6 = 1e12 / USD_per_SOL_e6
+        // This converts USD/SOL to SOL/USD while maintaining e6 precision
+        let inverted = (1_000_000_000_000u128)
+            .checked_div(raw_price as u128)
+            .ok_or(PercolatorError::OracleInvalid)?;
+
+        if inverted == 0 {
+            return Err(PercolatorError::OracleInvalid.into());
+        }
+        if inverted > u64::MAX as u128 {
+            return Err(PercolatorError::EngineOverflow.into());
+        }
+
+        Ok(inverted as u64)
+    }
 }
 
-// 8. mod collateral
+// 9. mod collateral
 pub mod collateral {
     use solana_program::{
         account_info::AccountInfo, program_error::ProgramError,
@@ -1572,7 +1669,7 @@ pub mod processor {
         match instruction {
             Instruction::InitMarket {
                 admin, collateral_mint, pyth_index, pyth_collateral,
-                max_staleness_slots, conf_filter_bps, risk_params
+                max_staleness_slots, conf_filter_bps, invert, unit_scale, risk_params
             } => {
                 accounts::expect_len(accounts, 11)?;
                 let a_admin = &accounts[0];
@@ -1644,7 +1741,8 @@ pub mod processor {
                     max_staleness_slots,
                     conf_filter_bps,
                     vault_authority_bump: bump,
-                    _padding: [0; 5],
+                    invert,
+                    unit_scale,
                 };
                 state::write_config(&mut data, &config);
 
@@ -1684,11 +1782,18 @@ pub mod processor {
                 verify_vault(a_vault, &auth, &mint, &Pubkey::new_from_array(config.vault_pubkey))?;
                 verify_token_account(a_user_ata, a_user.key, &mint)?;
 
-                let engine = zc::engine_mut(&mut data)?;
-
+                // Transfer base tokens to vault
                 collateral::deposit(a_token, a_user_ata, a_vault, a_user, fee_payment)?;
 
-                let idx = engine.add_user(fee_payment as u128).map_err(map_risk_error)?;
+                // Convert base tokens to units for engine
+                let (units, dust) = crate::units::base_to_units(fee_payment, config.unit_scale);
+
+                // Accumulate dust
+                let old_dust = state::read_dust_base(&data);
+                state::write_dust_base(&mut data, old_dust.saturating_add(dust));
+
+                let engine = zc::engine_mut(&mut data)?;
+                let idx = engine.add_user(units as u128).map_err(map_risk_error)?;
                 engine.set_owner(idx, a_user.key.to_bytes()).map_err(map_risk_error)?;
             },
             Instruction::InitLP { matcher_program, matcher_context, fee_payment } => {
@@ -1713,11 +1818,18 @@ pub mod processor {
                 verify_vault(a_vault, &auth, &mint, &Pubkey::new_from_array(config.vault_pubkey))?;
                 verify_token_account(a_user_ata, a_user.key, &mint)?;
 
-                let engine = zc::engine_mut(&mut data)?;
-
+                // Transfer base tokens to vault
                 collateral::deposit(a_token, a_user_ata, a_vault, a_user, fee_payment)?;
 
-                let idx = engine.add_lp(matcher_program.to_bytes(), matcher_context.to_bytes(), fee_payment as u128).map_err(map_risk_error)?;
+                // Convert base tokens to units for engine
+                let (units, dust) = crate::units::base_to_units(fee_payment, config.unit_scale);
+
+                // Accumulate dust
+                let old_dust = state::read_dust_base(&data);
+                state::write_dust_base(&mut data, old_dust.saturating_add(dust));
+
+                let engine = zc::engine_mut(&mut data)?;
+                let idx = engine.add_lp(matcher_program.to_bytes(), matcher_context.to_bytes(), units as u128).map_err(map_risk_error)?;
                 engine.set_owner(idx, a_user.key.to_bytes()).map_err(map_risk_error)?;
             },
             Instruction::DepositCollateral { user_idx, amount } => {
@@ -1742,6 +1854,16 @@ pub mod processor {
                 verify_vault(a_vault, &auth, &mint, &Pubkey::new_from_array(config.vault_pubkey))?;
                 verify_token_account(a_user_ata, a_user.key, &mint)?;
 
+                // Transfer base tokens to vault
+                collateral::deposit(a_token, a_user_ata, a_vault, a_user, amount)?;
+
+                // Convert base tokens to units for engine
+                let (units, dust) = crate::units::base_to_units(amount, config.unit_scale);
+
+                // Accumulate dust
+                let old_dust = state::read_dust_base(&data);
+                state::write_dust_base(&mut data, old_dust.saturating_add(dust));
+
                 let engine = zc::engine_mut(&mut data)?;
 
                 check_idx(engine, user_idx)?;
@@ -1752,8 +1874,7 @@ pub mod processor {
                     return Err(PercolatorError::EngineUnauthorized.into());
                 }
 
-                collateral::deposit(a_token, a_user_ata, a_vault, a_user, amount)?;
-                engine.deposit(user_idx, amount as u128).map_err(map_risk_error)?;
+                engine.deposit(user_idx, units as u128).map_err(map_risk_error)?;
             },
             Instruction::WithdrawCollateral { user_idx, amount } => {
                 accounts::expect_len(accounts, 8)?;
@@ -1798,16 +1919,24 @@ pub mod processor {
                 verify_token_account(a_user_ata, a_user.key, &mint)?;
 
                 let clock = Clock::from_account_info(a_clock)?;
-                let price = oracle::read_pyth_price_e6(
+                // Use engine price (with inversion if configured)
+                let price = oracle::read_engine_price_e6(
                     a_oracle_idx,
                     clock.slot,
                     config.max_staleness_slots,
                     config.conf_filter_bps,
+                    config.invert,
                 )?;
 
+                // Convert requested base tokens to units
+                let (units_requested, _) = crate::units::base_to_units(amount, config.unit_scale);
+
                 engine
-                    .withdraw(user_idx, amount as u128, clock.slot, price)
+                    .withdraw(user_idx, units_requested as u128, clock.slot, price)
                     .map_err(map_risk_error)?;
+
+                // Convert units back to base tokens for payout
+                let base_to_pay = crate::units::units_to_base(units_requested, config.unit_scale);
 
                 let seed1: &[u8] = b"vault";
                 let seed2: &[u8] = a_slab.key.as_ref();
@@ -1821,7 +1950,7 @@ pub mod processor {
                     a_vault,
                     a_user_ata,
                     a_vault_pda,
-                    amount,
+                    base_to_pay,
                     &signer_seeds,
                 )?;
             },
@@ -1865,6 +1994,10 @@ pub mod processor {
                     return Err(ProgramError::InvalidArgument);
                 }
 
+                // Read dust before borrowing engine (for dust sweep later)
+                let dust_before = state::read_dust_base(&data);
+                let unit_scale = config.unit_scale;
+
                 let engine = zc::engine_mut(&mut data)?;
 
                 // Crank authorization:
@@ -1879,7 +2012,14 @@ pub mod processor {
                 }
 
                 let clock = Clock::from_account_info(a_clock)?;
-                let price = oracle::read_pyth_price_e6(a_oracle, clock.slot, config.max_staleness_slots, config.conf_filter_bps)?;
+                // Use engine price (with inversion if configured)
+                let price = oracle::read_engine_price_e6(
+                    a_oracle,
+                    clock.slot,
+                    config.max_staleness_slots,
+                    config.conf_filter_bps,
+                    config.invert,
+                )?;
 
                 // Execute crank with effective_caller_idx for clarity
                 // In permissionless mode, pass CRANK_NO_CALLER to engine (out-of-range = no caller settle)
@@ -1901,6 +2041,21 @@ pub mod processor {
                     msg!("CU_CHECKPOINT: keeper_crank_end");
                     sol_log_compute_units();
                 }
+
+                // Dust sweep: if accumulated dust >= unit_scale, sweep to insurance fund
+                // Done before copying stats so insurance balance reflects the sweep
+                let remaining_dust = if unit_scale > 0 {
+                    let scale = unit_scale as u64;
+                    if dust_before >= scale {
+                        let units_to_sweep = dust_before / scale;
+                        engine.top_up_insurance_fund(units_to_sweep as u128).map_err(map_risk_error)?;
+                        Some(dust_before % scale)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
 
                 // Copy stats before threshold update (avoid borrow conflict)
                 let liqs = engine.lifetime_liquidations;
@@ -1937,6 +2092,11 @@ pub mod processor {
                     engine.set_risk_reduction_threshold(final_thresh.clamp(THRESH_MIN, THRESH_MAX));
                     drop(engine);
                     state::write_last_thr_update_slot(&mut data, clock.slot);
+                }
+
+                // Write remaining dust if sweep occurred
+                if let Some(dust) = remaining_dust {
+                    state::write_dust_base(&mut data, dust);
                 }
 
                 // Debug: log lifetime counters (sol_log_64: tag, liqs, force, max_accounts, insurance)
@@ -1984,7 +2144,14 @@ pub mod processor {
                     return Err(ProgramError::InvalidArgument);
                 }
 
-                let price = oracle::read_pyth_price_e6(a_oracle, clock.slot, config.max_staleness_slots, config.conf_filter_bps)?;
+                // Use engine price (with inversion if configured)
+                let price = oracle::read_engine_price_e6(
+                    a_oracle,
+                    clock.slot,
+                    config.max_staleness_slots,
+                    config.conf_filter_bps,
+                    config.invert,
+                )?;
 
                 // Gate: if insurance_fund <= threshold, only allow risk-reducing trades
                 // LP delta is -size (LP takes opposite side of user's trade)
@@ -2119,7 +2286,14 @@ pub mod processor {
                 }
 
                 let clock = Clock::from_account_info(a_clock)?;
-                let price = oracle::read_pyth_price_e6(a_oracle, clock.slot, config.max_staleness_slots, config.conf_filter_bps)?;
+                // Use engine price (with inversion if configured)
+                let price = oracle::read_engine_price_e6(
+                    a_oracle,
+                    clock.slot,
+                    config.max_staleness_slots,
+                    config.conf_filter_bps,
+                    config.invert,
+                )?;
 
                 // Note: We don't zero the matcher_ctx before CPI because we don't own it.
                 // Security is maintained by ABI validation which checks req_id (nonce),
@@ -2243,7 +2417,14 @@ pub mod processor {
                 check_idx(engine, target_idx)?;
 
                 let clock = Clock::from_account_info(&accounts[2])?;
-                let price = oracle::read_pyth_price_e6(a_oracle, clock.slot, config.max_staleness_slots, config.conf_filter_bps)?;
+                // Use engine price (with inversion if configured)
+                let price = oracle::read_engine_price_e6(
+                    a_oracle,
+                    clock.slot,
+                    config.max_staleness_slots,
+                    config.conf_filter_bps,
+                    config.invert,
+                )?;
 
                 #[cfg(feature = "cu-audit")]
                 {
@@ -2298,20 +2479,30 @@ pub mod processor {
                 }
 
                 let clock = Clock::from_account_info(&accounts[6])?;
-                let price = oracle::read_pyth_price_e6(a_oracle, clock.slot, config.max_staleness_slots, config.conf_filter_bps)?;
+                // Use engine price (with inversion if configured)
+                let price = oracle::read_engine_price_e6(
+                    a_oracle,
+                    clock.slot,
+                    config.max_staleness_slots,
+                    config.conf_filter_bps,
+                    config.invert,
+                )?;
 
                 #[cfg(feature = "cu-audit")]
                 {
                     msg!("CU_CHECKPOINT: close_account_start");
                     sol_log_compute_units();
                 }
-                let amt = engine.close_account(user_idx, clock.slot, price).map_err(map_risk_error)?;
+                let amt_units = engine.close_account(user_idx, clock.slot, price).map_err(map_risk_error)?;
                 #[cfg(feature = "cu-audit")]
                 {
                     msg!("CU_CHECKPOINT: close_account_end");
                     sol_log_compute_units();
                 }
-                let amt_u64: u64 = amt.try_into().map_err(|_| PercolatorError::EngineOverflow)?;
+                let amt_units_u64: u64 = amt_units.try_into().map_err(|_| PercolatorError::EngineOverflow)?;
+
+                // Convert units to base tokens for payout
+                let base_to_pay = crate::units::units_to_base(amt_units_u64, config.unit_scale);
 
                 let seed1: &[u8] = b"vault";
                 let seed2: &[u8] = a_slab.key.as_ref();
@@ -2320,7 +2511,7 @@ pub mod processor {
                 let seeds: [&[u8]; 3] = [seed1, seed2, seed3];
                 let signer_seeds: [&[&[u8]]; 1] = [&seeds];
 
-                collateral::withdraw(a_token, a_vault, a_user_ata, a_pda, amt_u64, &signer_seeds)?;
+                collateral::withdraw(a_token, a_vault, a_user_ata, a_pda, base_to_pay, &signer_seeds)?;
             },
             Instruction::TopUpInsurance { amount } => {
                 accounts::expect_len(accounts, 5)?;
@@ -2344,10 +2535,18 @@ pub mod processor {
                 verify_vault(a_vault, &auth, &mint, &Pubkey::new_from_array(config.vault_pubkey))?;
                 verify_token_account(a_user_ata, a_user.key, &mint)?;
 
-                let engine = zc::engine_mut(&mut data)?;
-
+                // Transfer base tokens to vault
                 collateral::deposit(a_token, a_user_ata, a_vault, a_user, amount)?;
-                engine.top_up_insurance_fund(amount as u128).map_err(map_risk_error)?;
+
+                // Convert base tokens to units for engine
+                let (units, dust) = crate::units::base_to_units(amount, config.unit_scale);
+
+                // Accumulate dust
+                let old_dust = state::read_dust_base(&data);
+                state::write_dust_base(&mut data, old_dust.saturating_add(dust));
+
+                let engine = zc::engine_mut(&mut data)?;
+                engine.top_up_insurance_fund(units as u128).map_err(map_risk_error)?;
             },
             Instruction::SetRiskThreshold { new_threshold } => {
                 accounts::expect_len(accounts, 2)?;
