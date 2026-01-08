@@ -2020,7 +2020,6 @@ pub mod processor {
                     config.conf_filter_bps,
                     config.invert,
                 )?;
-
                 // Execute crank with effective_caller_idx for clarity
                 // In permissionless mode, pass CRANK_NO_CALLER to engine (out-of-range = no caller settle)
                 let effective_caller_idx = if permissionless { CRANK_NO_CALLER } else { caller_idx };
@@ -2720,7 +2719,8 @@ mod tests {
         let (vault_pda, _) = Pubkey::find_program_address(&[b"vault", slab_key.as_ref()], &program_id);
         let mint_key = Pubkey::new_unique();
 
-        let pyth_data = make_pyth(1000, -6, 1, 100); 
+        // Price = $100 (100_000_000 in e6 format), expo = -6, conf = 1, pub_slot = 100
+        let pyth_data = make_pyth(100_000_000, -6, 1, 100);
 
         MarketFixture {
             program_id,
@@ -2738,9 +2738,10 @@ mod tests {
         }
     }
 
-    // --- Encoders --- 
-    
+    // --- Encoders ---
+
     fn encode_u64(val: u64, buf: &mut Vec<u8>) { buf.extend_from_slice(&val.to_le_bytes()); }
+    fn encode_u32(val: u32, buf: &mut Vec<u8>) { buf.extend_from_slice(&val.to_le_bytes()); }
     fn encode_u16(val: u16, buf: &mut Vec<u8>) { buf.extend_from_slice(&val.to_le_bytes()); }
     fn encode_i128(val: i128, buf: &mut Vec<u8>) { buf.extend_from_slice(&val.to_le_bytes()); }
     fn encode_u128(val: u128, buf: &mut Vec<u8>) { buf.extend_from_slice(&val.to_le_bytes()); }
@@ -2754,7 +2755,9 @@ mod tests {
         encode_pubkey(&fixture.pyth_col.key, &mut data);
         encode_u64(100, &mut data);
         encode_u16(500, &mut data);
-        
+        data.push(0u8); // invert (0 = no inversion)
+        encode_u32(0, &mut data); // unit_scale (0 = no scaling)
+
         encode_u64(0, &mut data);
         encode_u64(0, &mut data);
         encode_u64(0, &mut data);
@@ -2835,6 +2838,12 @@ mod tests {
     fn encode_update_admin(new_admin: &Pubkey) -> Vec<u8> {
         let mut data = vec![12u8];
         encode_pubkey(new_admin, &mut data);
+        data
+    }
+
+    fn encode_topup_insurance(amount: u64) -> Vec<u8> {
+        let mut data = vec![9u8];
+        encode_u64(amount, &mut data);
         data
     }
 
@@ -3512,6 +3521,15 @@ mod tests {
             let engine = zc::engine_ref(&f.slab.data).unwrap();
             let risk_units = crate::compute_system_risk_units(engine);
             assert!(risk_units > 0, "risk_units should be > 0 when there are LP positions");
+        }
+
+        // Top up insurance to prevent force_realize from triggering during crank
+        // (force_realize triggers when insurance <= threshold, both start at 0)
+        {
+            let mut funder = TestAccount::new(Pubkey::new_unique(), solana_program::system_program::id(), 0, vec![]).signer();
+            let mut funder_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0, make_token_account(f.mint.key, funder.key, 1_000_000_000)).writable();
+            let accs = vec![funder.to_info(), f.slab.to_info(), funder_ata.to_info(), f.vault.to_info(), f.token_prog.to_info()];
+            process_instruction(&f.program_id, &accs, &encode_topup_insurance(1_000_000_000)).unwrap();
         }
 
         // Now call crank - this should update threshold based on risk metric
