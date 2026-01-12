@@ -47,7 +47,7 @@ pub mod constants {
     // Default funding parameters (used at init_market, can be changed via update_config)
     pub const DEFAULT_FUNDING_HORIZON_SLOTS: u64 = 500;            // ~4 min @ ~2 slots/sec
     pub const DEFAULT_FUNDING_K_BPS: u64 = 100;                    // 1.00x multiplier
-    pub const DEFAULT_FUNDING_INV_SCALE_NOTIONAL_E6: u128 = 1_000_000_000_000; // 1M USDC notional in e6
+    pub const DEFAULT_FUNDING_INV_SCALE_NOTIONAL_E6: u128 = 1_000_000_000_000; // Funding scale factor (e6 units)
     pub const DEFAULT_FUNDING_MAX_PREMIUM_BPS: i64 = 500;          // cap premium at 5.00%
     pub const DEFAULT_FUNDING_MAX_BPS_PER_SLOT: i64 = 5;           // cap per-slot funding
 
@@ -698,7 +698,7 @@ pub mod verify {
     /// Inversion constant: 1e12 for price_e6 * inverted_e6 = 1e12
     pub const INVERSION_CONSTANT: u128 = 1_000_000_000_000;
 
-    /// Invert oracle price: SOL_per_USD_e6 = 1e12 / USD_per_SOL_e6
+    /// Invert oracle price: inverted_e6 = 1e12 / raw_e6
     /// Returns None if raw == 0 or result overflows u64.
     #[inline]
     pub fn invert_price_e6(raw: u64, invert: u8) -> Option<u64> {
@@ -1013,7 +1013,7 @@ pub mod ix {
             /// Maximum staleness in seconds
             max_staleness_secs: u64,
             conf_filter_bps: u16,
-            /// If non-zero, invert oracle price (USD/SOL -> SOL/USD)
+            /// If non-zero, invert oracle price (raw -> 1e12/raw)
             invert: u8,
             /// Lamports per Unit for boundary conversion (0 = no scaling)
             unit_scale: u32,
@@ -1324,7 +1324,7 @@ pub mod state {
         pub max_staleness_secs: u64,
         pub conf_filter_bps: u16,
         pub vault_authority_bump: u8,
-        /// If non-zero, invert the oracle price (USD_per_SOL -> SOL_per_USD)
+        /// If non-zero, invert the oracle price (raw -> 1e12/raw)
         pub invert: u8,
         /// Lamports per Unit for conversion (e.g., 1000 means 1 SOL = 1,000,000 Units)
         /// If 0, no scaling is applied (1:1 lamports to units)
@@ -1337,7 +1337,7 @@ pub mod state {
         pub funding_horizon_slots: u64,
         /// Funding rate multiplier in basis points (100 = 1.00x)
         pub funding_k_bps: u64,
-        /// Inverse scale notional in e6 (1e12 = $1M)
+        /// Funding scale factor in e6 units (controls funding rate sensitivity)
         pub funding_inv_scale_notional_e6: u128,
         /// Max premium in basis points (500 = 5%)
         pub funding_max_premium_bps: i64,
@@ -1530,7 +1530,7 @@ pub mod oracle {
     /// - max_staleness_secs: Maximum age in seconds
     /// - conf_bps: Maximum confidence interval in basis points
     ///
-    /// Returns the price in e6 format (e.g., 150_000_000 = $150.00).
+    /// Returns the price in e6 format (e.g., 150_000_000 = 150.00 in base units).
     pub fn read_pyth_price_e6(
         price_ai: &AccountInfo,
         expected_feed_id: &[u8; 32],
@@ -1624,7 +1624,7 @@ pub mod oracle {
     /// - now_unix_ts: Current unix timestamp (from clock.unix_timestamp)
     /// - max_staleness_secs: Maximum age in seconds
     ///
-    /// Returns the price in e6 format (e.g., 150_000_000 = $150.00).
+    /// Returns the price in e6 format (e.g., 150_000_000 = 150.00 in base units).
     /// Note: Chainlink doesn't have confidence intervals, so conf_bps is not used.
     pub fn read_chainlink_price_e6(
         price_ai: &AccountInfo,
@@ -1711,8 +1711,8 @@ pub mod oracle {
     /// - PYTH_RECEIVER_PROGRAM_ID: reads Pyth PriceUpdateV2
     /// - CHAINLINK_OCR2_PROGRAM_ID: reads Chainlink OCR2 Transmissions
     ///
-    /// If invert == 0: returns USD_per_SOL_e6 (normal)
-    /// If invert != 0: returns SOL_per_USD_e6 = 1e12 / USD_per_SOL_e6 (inverted)
+    /// If invert == 0: returns raw oracle price_e6
+    /// If invert != 0: returns inverted price = 1e12 / raw_e6
     ///
     /// The raw oracle is validated (staleness, confidence for Pyth) BEFORE inversion.
     pub fn read_engine_price_e6(
@@ -1744,7 +1744,7 @@ pub mod oracle {
             return Ok(raw_price);
         }
 
-        // Invert: SOL_per_USD_e6 = 1e12 / USD_per_SOL_e6
+        // Invert: inverted_e6 = 1e12 / raw_e6
         let inverted = (1_000_000_000_000u128)
             .checked_div(raw_price as u128)
             .ok_or(PercolatorError::OracleInvalid)?;
