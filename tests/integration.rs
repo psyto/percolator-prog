@@ -1537,6 +1537,90 @@ fn test_hyperp_issue_default_cap_zero_bypasses_smoothing() {
     // This test documents the configuration requirement
 }
 
+// ============================================================================
+// Hyperp Security Analysis - Critical Findings
+// ============================================================================
+
+/// CRITICAL FINDING: No exec_price bounds validation in TradeCpi
+///
+/// In TradeCpi, the matcher can return ANY non-zero exec_price_e6.
+/// This exec_price becomes the new mark price in Hyperp mode.
+///
+/// Attack scenario:
+/// 1. Malicious/buggy matcher returns exec_price = 1 or exec_price = MAX
+/// 2. Mark price is set to this extreme value
+/// 3. If index smoothing is disabled (cap=0), index immediately follows
+/// 4. Premium = (mark - index) / index -> extreme funding rate (clamped to 5%)
+///
+/// Current mitigations:
+/// - Funding rate clamped by funding_max_premium_bps (default 5%)
+/// - Funding rate clamped by funding_max_bps_per_slot (default 5 bps)
+/// - Liquidations use index price, not mark price
+///
+/// Residual risk:
+/// - 5% funding rate per horizon (500 slots) = significant drain
+/// - If combined with disabled smoothing, index manipulation possible
+///
+/// RECOMMENDATION: Add bounds check that exec_price is within X% of oracle_price
+#[test]
+fn test_hyperp_security_no_exec_price_bounds() {
+    println!("HYPERP SECURITY FINDING: No exec_price bounds validation");
+    println!("");
+    println!("In TradeCpi, validate_matcher_return() checks:");
+    println!("  - ABI version matches");
+    println!("  - VALID flag set, REJECTED flag not set");
+    println!("  - lp_account_id, oracle_price_e6, req_id echoed correctly");
+    println!("  - exec_price_e6 != 0");
+    println!("  - exec_size <= req_size with same sign");
+    println!("");
+    println!("BUT: No check that exec_price is close to oracle_price!");
+    println!("");
+    println!("Matcher can return exec_price = 1 or exec_price = u64::MAX");
+    println!("This becomes the mark price in Hyperp mode");
+    println!("");
+    println!("MITIGATIONS:");
+    println!("  - funding_max_premium_bps = 500 (5% cap)");
+    println!("  - funding_max_bps_per_slot = 5 (5 bps cap)");
+    println!("  - Liquidations use index, not mark");
+    println!("");
+    println!("RECOMMENDATION: Add exec_price bounds check in validate_matcher_return()");
+    println!("  e.g., require |exec_price - oracle_price| / oracle_price <= max_slippage_bps");
+}
+
+/// HIGH FINDING: Combined risk - Disabled smoothing + No price bounds
+///
+/// When oracle_price_cap_e2bps = 0 (default):
+/// - Index immediately follows mark (no rate limiting)
+/// - Combined with unbounded exec_price, allows index manipulation
+///
+/// Attack scenario:
+/// 1. Market initialized with default cap = 0
+/// 2. Malicious matcher returns extreme exec_price
+/// 3. Mark jumps to extreme value
+/// 4. Index immediately follows (no smoothing)
+/// 5. Next crank uses manipulated index for all calculations
+///
+/// RECOMMENDATION: Require non-zero oracle_price_cap_e2bps for Hyperp markets
+#[test]
+fn test_hyperp_security_combined_smoothing_price_risk() {
+    println!("HYPERP SECURITY FINDING: Combined risk amplification");
+    println!("");
+    println!("Default configuration:");
+    println!("  oracle_price_cap_e2bps = 0  <- Index smoothing DISABLED");
+    println!("  No exec_price bounds        <- Mark can be set to anything");
+    println!("");
+    println!("Combined attack:");
+    println!("  1. Init Hyperp market (cap defaults to 0)");
+    println!("  2. TradeCpi with malicious matcher");
+    println!("  3. Matcher returns exec_price = 2x index");
+    println!("  4. Mark set to 2x index");
+    println!("  5. clamp_toward_with_dt() with cap=0 returns mark immediately");
+    println!("  6. Index now = 2x original index");
+    println!("  7. All subsequent operations use manipulated index");
+    println!("");
+    println!("RECOMMENDATION: Validate oracle_price_cap_e2bps > 0 for Hyperp in InitMarket");
+}
+
 /// Test: Hyperp mode InitMarket succeeds with valid initial_mark_price
 #[test]
 fn test_hyperp_init_market_with_valid_price() {
