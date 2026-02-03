@@ -128,6 +128,19 @@ fn encode_init_matcher(mode: u8, trading_fee_bps: u32, spread_bps: u32) -> Vec<u
     data
 }
 
+fn encode_set_oracle_authority(new_authority: &Pubkey) -> Vec<u8> {
+    let mut data = vec![16u8]; // SetOracleAuthority tag
+    data.extend_from_slice(new_authority.as_ref());
+    data
+}
+
+fn encode_push_oracle_price(price_e6: u64, timestamp: i64) -> Vec<u8> {
+    let mut data = vec![17u8]; // PushOraclePrice tag
+    data.extend_from_slice(&price_e6.to_le_bytes());
+    data.extend_from_slice(&timestamp.to_le_bytes());
+    data
+}
+
 /// Create a test market on devnet
 #[test]
 #[ignore] // Run with: cargo test --test devnet_test -- --ignored --nocapture
@@ -499,8 +512,67 @@ fn test_devnet_full_lifecycle() {
         }
     }
 
-    // Step 7: Execute trade (TradeNoCpi for simplicity)
-    println!("\n--- Step 7: Executing trade ---");
+    // Step 7: Set oracle authority (admin = payer)
+    println!("\n--- Step 7: Setting oracle authority ---");
+    let set_authority_ix = Instruction {
+        program_id,
+        accounts: vec![
+            AccountMeta::new(payer.pubkey(), true), // admin signer
+            AccountMeta::new(slab.pubkey(), false),
+        ],
+        data: encode_set_oracle_authority(&payer.pubkey()),
+    };
+
+    let blockhash = client.get_latest_blockhash().unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[set_authority_ix],
+        Some(&payer.pubkey()),
+        &[&payer],
+        blockhash,
+    );
+
+    match client.send_and_confirm_transaction(&tx) {
+        Ok(sig) => println!("Oracle authority set: {}", sig),
+        Err(e) => {
+            println!("Failed to set oracle authority: {:?}", e);
+            return;
+        }
+    }
+
+    // Step 8: Push oracle price ($138 in e6 format)
+    println!("\n--- Step 8: Pushing oracle price ---");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    let push_price_ix = Instruction {
+        program_id,
+        accounts: vec![
+            AccountMeta::new(payer.pubkey(), true), // authority signer
+            AccountMeta::new(slab.pubkey(), false),
+        ],
+        data: encode_push_oracle_price(138_000_000, now), // $138
+    };
+
+    let blockhash = client.get_latest_blockhash().unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[push_price_ix],
+        Some(&payer.pubkey()),
+        &[&payer],
+        blockhash,
+    );
+
+    match client.send_and_confirm_transaction(&tx) {
+        Ok(sig) => println!("Oracle price pushed ($138): {}", sig),
+        Err(e) => {
+            println!("Failed to push oracle price: {:?}", e);
+            return;
+        }
+    }
+
+    // Step 9: Execute trade (TradeNoCpi for simplicity)
+    println!("\n--- Step 9: Executing trade ---");
     let trade_ix = Instruction {
         program_id,
         accounts: vec![
@@ -529,8 +601,8 @@ fn test_devnet_full_lifecycle() {
         }
     }
 
-    // Step 8: Run crank
-    println!("\n--- Step 8: Running crank ---");
+    // Step 10: Run crank
+    println!("\n--- Step 10: Running crank ---");
     let crank_ix = Instruction {
         program_id,
         accounts: vec![
