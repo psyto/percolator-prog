@@ -997,6 +997,7 @@ pub mod error {
         InvalidTokenAccount,
         InvalidTokenProgram,
         InvalidConfigParam,
+        HyperpTradeNoCpiDisabled,
     }
 
     impl From<PercolatorError> for ProgramError {
@@ -2821,18 +2822,14 @@ pub mod processor {
                 let clock = Clock::from_account_info(&accounts[3])?;
                 let a_oracle = &accounts[4];
 
-                // Read oracle price: Hyperp mode uses index directly, otherwise circuit-breaker clamping
-                let is_hyperp = oracle::is_hyperp_mode(&config);
-                let price = if is_hyperp {
-                    // Hyperp mode: use current index price for trade execution
-                    let idx = config.last_effective_price_e6;
-                    if idx == 0 {
-                        return Err(PercolatorError::OracleInvalid.into());
-                    }
-                    idx
-                } else {
-                    oracle::read_price_clamped(&mut config, a_oracle, clock.unix_timestamp)?
-                };
+                // Hyperp mode: reject TradeNoCpi to prevent mark price manipulation
+                // All trades must go through TradeCpi with a pinned matcher
+                if oracle::is_hyperp_mode(&config) {
+                    return Err(PercolatorError::HyperpTradeNoCpiDisabled.into());
+                }
+
+                // Read oracle price with circuit-breaker clamping
+                let price = oracle::read_price_clamped(&mut config, a_oracle, clock.unix_timestamp)?;
                 state::write_config(&mut data, &config);
 
                 let engine = zc::engine_mut(&mut data)?;
@@ -2885,13 +2882,6 @@ pub mod processor {
                 {
                     msg!("CU_CHECKPOINT: trade_nocpi_execute_end");
                     sol_log_compute_units();
-                }
-
-                // Hyperp mode: update mark price after successful trade
-                if is_hyperp {
-                    let mut config = state::read_config(&data);
-                    config.authority_price_e6 = price;
-                    state::write_config(&mut data, &config);
                 }
             },
             Instruction::TradeCpi { lp_idx, user_idx, size } => {
