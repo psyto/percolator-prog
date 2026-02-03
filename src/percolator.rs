@@ -50,6 +50,7 @@ pub mod constants {
     pub const DEFAULT_FUNDING_INV_SCALE_NOTIONAL_E6: u128 = 1_000_000_000_000; // Funding scale factor (e6 units)
     pub const DEFAULT_FUNDING_MAX_PREMIUM_BPS: i64 = 500;          // cap premium at 5.00%
     pub const DEFAULT_FUNDING_MAX_BPS_PER_SLOT: i64 = 5;           // cap per-slot funding
+    pub const DEFAULT_HYPERP_PRICE_CAP_E2BPS: u64 = 10_000;       // 1% per slot max price change for Hyperp
 
     // Matcher call ABI offsets (67-byte layout)
     // byte 0: tag (u8)
@@ -2116,7 +2117,8 @@ pub mod processor {
         accounts,
         constants::{MAGIC, VERSION, SLAB_LEN, CONFIG_LEN, MATCHER_CONTEXT_LEN, MATCHER_CALL_TAG, MATCHER_CALL_LEN, MATCHER_CONTEXT_PREFIX_LEN,
             DEFAULT_FUNDING_HORIZON_SLOTS, DEFAULT_FUNDING_K_BPS, DEFAULT_FUNDING_INV_SCALE_NOTIONAL_E6, DEFAULT_FUNDING_MAX_PREMIUM_BPS, DEFAULT_FUNDING_MAX_BPS_PER_SLOT,
-            DEFAULT_THRESH_FLOOR, DEFAULT_THRESH_RISK_BPS, DEFAULT_THRESH_UPDATE_INTERVAL_SLOTS, DEFAULT_THRESH_STEP_BPS, DEFAULT_THRESH_ALPHA_BPS, DEFAULT_THRESH_MIN, DEFAULT_THRESH_MAX, DEFAULT_THRESH_MIN_STEP},
+            DEFAULT_THRESH_FLOOR, DEFAULT_THRESH_RISK_BPS, DEFAULT_THRESH_UPDATE_INTERVAL_SLOTS, DEFAULT_THRESH_STEP_BPS, DEFAULT_THRESH_ALPHA_BPS, DEFAULT_THRESH_MIN, DEFAULT_THRESH_MAX, DEFAULT_THRESH_MIN_STEP,
+            DEFAULT_HYPERP_PRICE_CAP_E2BPS},
         error::{PercolatorError, map_risk_error},
         oracle,
         collateral,
@@ -2386,9 +2388,10 @@ pub mod processor {
                     oracle_authority: [0u8; 32],
                     authority_price_e6: if is_hyperp { initial_mark_price_e6 } else { 0 },
                     authority_timestamp: 0, // In Hyperp mode: stores funding rate (bps per slot)
-                    // Oracle price circuit breaker (disabled by default)
-                    // In Hyperp mode: used for rate-limited index smoothing
-                    oracle_price_cap_e2bps: 0,
+                    // Oracle price circuit breaker
+                    // In Hyperp mode: used for rate-limited index smoothing AND mark price clamping
+                    // Default: disabled for non-Hyperp, 1% per slot for Hyperp
+                    oracle_price_cap_e2bps: if is_hyperp { DEFAULT_HYPERP_PRICE_CAP_E2BPS } else { 0 },
                     last_effective_price_e6: if is_hyperp { initial_mark_price_e6 } else { 0 },
                 };
                 state::write_config(&mut data, &config);
@@ -3100,9 +3103,17 @@ pub mod processor {
                     state::write_req_nonce(&mut data, req_id);
 
                     // Hyperp mode: update mark price with execution price
+                    // Apply circuit breaker to prevent extreme mark price manipulation
                     if is_hyperp {
                         let mut config = state::read_config(&data);
-                        config.authority_price_e6 = ret.exec_price_e6;
+                        // Clamp exec_price against current index to prevent manipulation
+                        // Uses same circuit breaker as PushOraclePrice for consistency
+                        let clamped_mark = oracle::clamp_oracle_price(
+                            config.last_effective_price_e6,
+                            ret.exec_price_e6,
+                            config.oracle_price_cap_e2bps,
+                        );
+                        config.authority_price_e6 = clamped_mark;
                         state::write_config(&mut data, &config);
                     }
                 }
