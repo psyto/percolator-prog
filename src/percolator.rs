@@ -2909,7 +2909,9 @@ pub mod processor {
                 let a_lp_pda = &accounts[7];
 
                 accounts::expect_signer(a_user)?;
-                accounts::expect_signer(a_lp_owner)?;
+                // Note: a_lp_owner does NOT need to be a signer for TradeCpi.
+                // LP owner delegated trade authorization to the matcher program.
+                // The matcher CPI (via LP PDA invoke_signed) validates the trade.
                 accounts::expect_writable(a_slab)?;
                 accounts::expect_writable(a_matcher_ctx)?;
 
