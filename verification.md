@@ -4,14 +4,14 @@ This document provides a comprehensive verification matrix covering all security
 
 ## Test Summary
 
-**Total Tests: 43**
+**Total Tests: 42** (local LiteSVM tests)
 - Feature Tests: 11 comprehensive + 2 basic crank tests
 - Bug Regression Tests: 7
 - Security Tests: 8
 - Hyperp Mode Tests: 7
 - Matcher Tests: 4
 - **Critical Authorization Tests: 10** (NEW)
-- Devnet Integration: 1
+- Devnet Integration: See `percolator-cli/tests/`
 
 ---
 
@@ -108,9 +108,9 @@ This document provides a comprehensive verification matrix covering all security
 
 ## 10. Devnet Integration
 
-| Test | Description | Status |
-|------|-------------|--------|
-| `test_devnet_full_lifecycle` | Full market lifecycle on devnet | PASS |
+Devnet tests are in `percolator-cli/tests/`:
+- `t21-live-trading.ts` - Long-running live trading test
+- `t22-devnet-stress.ts` - Stress testing (cranks, price updates)
 
 ---
 

@@ -389,10 +389,10 @@ cargo kani --tests
 3. **Trade**: Call `TradeNoCpi` with LP index 0 and your user index
 4. **Check state**: Run `KeeperCrank` permissionlessly
 
-Example with admin oracle (for testing):
+Example with CLI (see `percolator-cli/`):
 ```bash
-# Run devnet integration test
-cargo test --test devnet_test -- --nocapture --ignored
+cd ../percolator-cli
+npx tsx tests/t22-devnet-stress.ts
 ```
 
 These addresses are deployed on Solana **devnet**.

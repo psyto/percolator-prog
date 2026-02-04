@@ -109,19 +109,16 @@ Percolator is a perpetual futures protocol deployed on Solana. It consists of tw
 
 ## Testing
 
-### Local Integration Tests (43 tests)
+### Local Integration Tests (42 tests)
 ```bash
 cargo test --test integration
 ```
 
-### Devnet Test (requires funded wallet)
+### Devnet Tests
+Devnet tests are in the `percolator-cli` package (TypeScript):
 ```bash
-cargo test --test devnet_test -- --ignored --nocapture
-```
-
-### Devnet Stress Test
-```bash
-cargo test --test devnet_test test_devnet_stress -- --ignored --nocapture
+cd ../percolator-cli
+npx tsx tests/t22-devnet-stress.ts
 ```
 
 ### Build BPF
@@ -147,10 +144,9 @@ percolator-prog/
 ├── src/
 │   └── percolator.rs      # Main program (3500+ lines)
 ├── tests/
-│   ├── integration.rs     # 43 LiteSVM tests
-│   └── devnet_test.rs     # Live devnet + stress tests
+│   └── integration.rs     # 43 LiteSVM tests
 ├── README.md              # High-level documentation
-├── verification.md        # Test matrix (43 tests)
+├── verification.md        # Test matrix (42 tests)
 ├── audit.md               # Security audit notes
 └── CLAUDE.md              # This file
 ```
