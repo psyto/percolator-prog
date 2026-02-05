@@ -586,3 +586,12 @@ The codebase continues to demonstrate strong security practices with comprehensi
 30. Position flip margin selection ✓
 31. Risk reduction mode ✓
 32. Two-pass settlement (Finding G fix) ✓
+
+## Known Open Issue
+
+**Bug #9**: Hyperp index smoothing bypass (clamp_toward_with_dt returns mark when dt=0)
+- **Status**: DOCUMENTED, NOT FIXED
+- **Test**: `test_hyperp_index_smoothing_multiple_cranks_same_slot`
+- **Severity**: Medium (requires multiple TXs in same slot, each costs fees)
+- **Recommendation**: Return `index` instead of `mark` when dt=0
+- See MEMORY.md and test for full analysis
