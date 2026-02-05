@@ -1505,8 +1505,23 @@ No external trust boundary - purely internal state
 
 No user manipulation possible for timing attacks
 
+#### 115. Error Path Atomicity ✓
+**Location**: Throughout percolator-prog
+**Status**: SECURE
+
+124 error return points in wrapper.
+Solana transaction atomicity guarantees:
+- ALL state changes reverted if instruction fails
+- Includes CPI token transfers
+- No partial state possible
+
+Pattern verification:
+- Deposit: CPI transfer → engine update (both revert on any failure)
+- Withdraw: Engine check → CPI transfer (both revert on any failure)
+- No external effects that persist after error
+
 ## Session 7 Summary (Updated)
 
-**Total Areas Verified**: 114
+**Total Areas Verified**: 115
 **New Vulnerabilities Found**: 0
 **All 57 Integration Tests**: PASS
