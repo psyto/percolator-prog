@@ -232,3 +232,82 @@ if cap_e2bps == 0 || dt_slots == 0 { return index; }  // Returns index, not mark
 3. reserved_pnl dead code (cleanup)
 
 No exploitable vulnerabilities found in this deep dive.
+
+---
+
+## Appendix: Kani Proof Quality Analysis
+
+### Overview
+
+The `percolator-prog/tests/kani.rs` file contains 146 Kani proofs. Analysis reveals that approximately 10-12 proofs are vacuous or trivially true, while ~135 provide real verification value.
+
+### Category 1: Vacuous Proofs (Fix Required)
+
+**1.1 `kani_unit_conversion_deterministic` (lines 2703-2720)**
+- **Issue**: Copies result instead of re-calling function
+- **Code**: `let (units2, dust2) = (units1, dust1);` (line 2716)
+- **Effect**: Proves `units1 == units1` - completely meaningless
+- **Fix**: Change to `let (units2, dust2) = base_to_units(base, scale);`
+
+**1.2 `kani_reject_has_no_chosen_size` (lines 1514-1528)**
+- **Issue**: Structural tautology - asserts `true` on enum match
+- **Code**: `assert!(true, "Reject has no chosen_size by construction");`
+- **Effect**: The match itself proves the structural property; assertion adds nothing
+- **Fix**: Either remove (enum structure is self-evident) or use `kani::cover!()` for coverage
+
+### Category 2: Identity Function Proofs (Low Value)
+
+These test trivial wrapper functions that return their input unchanged:
+
+| Proof | Function | Tests |
+|-------|----------|-------|
+| `kani_signer_ok_true` | `signer_ok(b) -> b` | `true == true` |
+| `kani_signer_ok_false` | `signer_ok(b) -> b` | `!false` |
+| `kani_writable_ok_true` | `writable_ok(b) -> b` | `true == true` |
+| `kani_writable_ok_false` | `writable_ok(b) -> b` | `!false` |
+
+**Verdict**: While not technically incorrect, these prove nothing useful.
+
+### Category 3: Fake Non-Interference (Trivially True)
+
+**3.1 `kani_admin_ok_independent_of_scale` (lines 2661-2675)**
+**3.2 `kani_owner_ok_independent_of_scale` (lines 2679-2698)**
+
+- **Issue**: Functions don't share any state - independence is trivially true
+- `admin_ok` compares `[u8; 32]` arrays, doesn't use `unit_scale`
+- `owner_ok` compares `[u8; 32]` arrays, doesn't use `unit_scale`
+- **Effect**: Proves that unrelated functions are unrelated
+
+### Category 4: Bounded Coverage (Documented Limitation)
+
+The proofs use narrow SAT-tractable bounds:
+- `KANI_MAX_SCALE = 64` (vs production `MAX_UNIT_SCALE = 1,000,000,000`)
+- `KANI_MAX_QUOTIENT = 4096`
+
+**Impact Assessment**:
+- Edge cases beyond these bounds are NOT verified by Kani
+- This is explicitly documented in the file (lines 58-64)
+- The narrow bounds are necessary for SAT solver tractability
+- Production uses `saturating_*` arithmetic which provides overflow safety
+
+### Category 5: Valuable Proofs (No Issues)
+
+The remaining ~135 proofs provide real verification value:
+
+| Category | Count | Examples |
+|----------|-------|----------|
+| Matcher ABI validation | 11 | Wrong version, missing flags, price bounds |
+| Authorization | 12 | Owner/admin/PDA mismatch rejection |
+| Nonce discipline | 5 | Monotonicity, wrap-around, unchanged on failure |
+| TradeCpi validation | 15 | Identity binding, shape checks, size constraints |
+| Gate/threshold | 4 | Active conditions, balance checks |
+| Unit conversion math | 12 | Division correctness, dust handling |
+| Oracle inversion | 8 | Price scaling, identity properties |
+
+### Recommendations
+
+1. **Fix `kani_unit_conversion_deterministic`**: Re-call `base_to_units` instead of copying
+2. **Remove identity proofs**: `signer_ok_*`, `writable_ok_*` test trivial wrappers
+3. **Remove fake non-interference proofs**: Independence is structural, not semantic
+4. **Document bounded coverage**: Add note that full-range testing relies on proptest/fuzzing
+5. **Consider `kani::cover!()`**: For structural properties, coverage is more meaningful than assertion

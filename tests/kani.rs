@@ -2698,7 +2698,7 @@ fn kani_owner_ok_independent_of_scale() {
 }
 
 /// Prove: unit conversion is deterministic - same inputs always give same outputs
-/// Uses purity-style proof to avoid duplicating division work in SAT solver
+/// Calls the function twice with the same inputs to verify identical results.
 #[kani::proof]
 fn kani_unit_conversion_deterministic() {
     let scale: u32 = kani::any();
@@ -2708,13 +2708,11 @@ fn kani_unit_conversion_deterministic() {
     let base: u64 = kani::any();
     kani::assume(base <= (scale.max(1) as u64) * KANI_MAX_QUOTIENT);
 
+    // Call the function twice with identical inputs
     let (units1, dust1) = base_to_units(base, scale);
+    let (units2, dust2) = base_to_units(base, scale);
 
-    // Purity proof: base_to_units is a pure function (no side effects, no nondeterminism)
-    // so calling it again with same args must yield same result.
-    // We prove this by asserting the result equals itself (trivially true for pure functions).
-    let (units2, dust2) = (units1, dust1);
-
+    // For a deterministic function, results must be identical
     assert_eq!(units1, units2, "base_to_units must be deterministic");
     assert_eq!(dust1, dust2, "base_to_units dust must be deterministic");
 }
