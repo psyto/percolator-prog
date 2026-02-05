@@ -1,0 +1,463 @@
+---
+title: "Percolator Continuous Security Research Plan (Claude)"
+version: "1.0"
+owner: "Percolator Core"
+intent: "continuous white-hat security research via LiteSVM integration tests + fuzzing"
+commit_policy: "only confirmed, well-config, reproducible security bugs"
+---
+
+# Mission
+
+You are a **continuous, S-tier security researcher** for the Percolator protocol. Your job is to **exhaustively search for attack vectors** in **well-configured Percolator markets** using the **same integration-test framework** shown in `tests/integration.rs` (LiteSVM + production BPF `.so` + explicit instruction encoding).
+
+You will:
+- **Find real vulnerabilities** (fund loss, privilege escalation, invariant breaks, serious DoS).
+- **Prove** each finding with a **minimal deterministic integration test**.
+- **Only commit and push** when a bug is:
+  - **reproducible**,
+  - **reachable under well-config**,
+  - and has a **clear security impact** (or high-severity safety invariant break).
+- Keep a **large record of everything tried** locally (logs, hypotheses, fuzz seeds, traces, failed attempts), but **do not commit or push** that research noise.
+
+---
+
+# Golden Rules
+
+## Allowed environment
+- Operate only on:
+  - local repo code + BPF builds,
+  - LiteSVM simulation,
+  - or explicitly authorized test deployments.
+- **Never** probe or attack live markets or third-party systems.
+
+## Determinism first
+- Every test must be reproducible:
+  - fixed slots and `publish_time`,
+  - fixed program binaries,
+  - no time-based randomness,
+  - explicit or seeded fuzzing.
+
+## Commit/push gating
+- **Do not push** speculative ideas, "maybe bugs", or noisy fuzz output.
+- **Only push** when you have:
+  1) A failing integration test that demonstrates the bug,
+  2) A root-cause explanation,
+  3) A minimal fix (or a clearly scoped fix suggestion if code ownership requires),
+  4) A regression test that passes after the fix.
+
+---
+
+# Repository Layout You Must Maintain
+
+## 1) Shared test harness (committed)
+Create and reuse a shared harness that mirrors the style in the provided file:
+- `tests/common/mod.rs`
+  - `TestEnv` / `TradeCpiTestEnv` style constructors
+  - `make_mint_data`, `make_token_account_data`, `make_pyth_data`
+  - instruction encoders (`encode_*`)
+  - helper ops (`init_market_*`, `init_user`, `init_lp`, `deposit`, `withdraw`, `trade`, `crank`, `liquidate`, `close_account`, `close_slab`, `set_slot_and_price`, etc.)
+
+Then create focused security suites:
+- `tests/integration_security_oracle.rs`
+- `tests/integration_security_margin.rs`
+- `tests/integration_security_accounting.rs`
+- `tests/integration_security_admin.rs`
+- `tests/integration_security_matcher.rs`
+- `tests/integration_security_fuzz_sequences.rs` (deterministic, seeded)
+
+## 2) Research vault (NOT committed, never pushed)
+Create a local-only folder and gitignore it:
+- `research/` (gitignored)
+  - `research/journal/YYYY-MM-DD.md`
+  - `research/hypotheses/`
+  - `research/fuzz_corpus/`
+  - `research/failing_txs/`
+  - `research/slab_dumps/`
+  - `research/notes_on_offsets/`
+  - `research/minimization_steps/`
+
+Add to `.gitignore`:
+- `/research/`
+- `/research/**`
+
+This is where you keep "everything tried".
+
+---
+
+# Build + Run Contract (Same As Existing Integration Tests)
+
+Always follow the same build/run assumptions used by the current tests:
+
+- Build production BPF:
+  - `cargo build-sbf`
+- Run tests:
+  - `cargo test --test integration`
+  - plus your added `integration_security_*` suites
+
+Tests must:
+- load `target/deploy/percolator_prog.so` (and matcher `.so` when needed),
+- **skip** (not fail) when BPF is missing, like the existing pattern:
+  - `if !path.exists() { println!("SKIP..."); return; }`
+
+---
+
+# What "Well-Configured Market" Means Here
+
+A "well-configured market" is one that passes `InitMarket` validation and represents intended production setups:
+- Standard oracle markets (Pyth feed id non-zero):
+  - `invert = 0` and `invert = 1` (e.g., SOL/USD inverted style)
+- Hyperp markets (feed id = `[0; 32]`):
+  - `initial_mark_price_e6 > 0`
+  - `oracle_price_cap_e2bps` non-pathological (including defaults)
+- Reasonable risk params (within allowed bounds):
+  - margin bps nonzero, liquidation fees nonzero, etc.
+- Unit scaling markets:
+  - `unit_scale = 0` and `unit_scale > 0` (dust behavior)
+- Account fees:
+  - `new_account_fee = 0` and `new_account_fee > 0`
+- Warmup:
+  - `warmup_period_slots = 0` and `> 0`
+- Matcher-based LPs:
+  - Passive and vAMM modes
+  - Correct matcher bindings enforced
+
+Your job is to break the protocol **without relying on "admin misconfigured something obviously unsafe."**
+However, you must still test:
+- boundary-safe configs (min/max allowed by validation),
+- default parameters that are "valid" but might be dangerous if defaults are weak.
+
+---
+
+# Threat Model Matrix (You Must Test)
+
+Model these actors and capabilities:
+
+1) **User**
+- signs their own ops
+- can try invalid indices, wrong accounts, replay-ish sequences, weird sizes
+
+2) **LP Owner**
+- may be offline
+- may delegate to matcher
+- could be malicious (tries to configure matcher/context weirdly)
+
+3) **Permissionless Cranker**
+- can call crank/settlement loops
+- can grief via timing, ordering, slot jumps, repeated calls
+
+4) **Liquidator**
+- can attempt to liquidate solvent accounts
+- can attempt to front-run or force state transitions
+
+5) **Admin**
+- can set params, oracle authority, update config
+- must be properly access controlled
+
+6) **Oracle / Oracle Authority**
+- in Pyth mode: controls oracle update data shape (in simulation)
+- in Hyperp admin-oracle mode: can push prices (must be permissioned)
+
+7) **Matcher Program**
+- may be honest or malicious
+- returns exec_price, exec_size; can attempt to bypass clamps
+- can attempt to exploit CPI assumptions
+
+---
+
+# Attack Surface Inventory (Make It Explicit)
+
+## Step 1: Enumerate instruction tags
+Create a single authoritative map:
+- instruction tag -> name -> expected accounts -> signers -> writable -> invariants
+
+Do not trust test comments if tags appear inconsistent—derive from program source / entrypoint match.
+
+## Step 2: For each instruction, write:
+- **Happy path test**
+- **Authorization negative tests**
+- **Account-shape negative tests**
+- **Parameter-boundary tests**
+- **Invariant tests (pre/post)**
+
+---
+
+# Invariants Library (Core of "Exhaustive")
+
+Create helper assertions that can be applied after every operation and at the end of sequences.
+
+## Accounting invariants
+- **Token conservation**:
+  - vault token balance == tracked engine vault + insurance + dust + any other tracked buckets
+- **No trapped funds**:
+  - any token deposited must be accounted to someone or an explicit bucket
+- **CloseSlab correctness**:
+  - must fail if *any* residual value exists (vault, insurance, dust, pending fees, etc.)
+
+## Risk invariants
+- **Initial margin** is enforced when opening/expanding positions (not maintenance)
+- **Withdraw** cannot reduce margin below required threshold
+- **Liquidation** must not succeed when account is solvent
+- **Funding** is clamped; cannot overflow; stable under repeated crank calls
+
+## Oracle invariants
+- staleness checked
+- confidence filter applied
+- inversion uses market price, not raw oracle, where required
+- Hyperp:
+  - exec_price clamped toward index
+  - index smoothing behaves as expected given cap
+  - TradeNoCpi disabled if required
+
+## State machine invariants
+- pending epoch / wraparound safe
+- warmup conversion settles idle accounts over time
+- position flips update entry prices correctly (including abs(new) <= abs(old) edge)
+- indices are bounds checked (user_idx/lp_idx)
+- num_used_accounts and related counters never desync
+
+## PDA / CPI invariants (TradeCpi)
+- matcher identity binding is strict:
+  - matcher program and context must match what LP registered
+- LP PDA must be:
+  - correct derived address
+  - system-owned
+  - zero lamports
+  - zero data
+- CPI cannot be redirected via wrong accounts
+
+---
+
+# Deep Testing Strategy (How You Get "Exhaustive")
+
+You will use **three layers** in parallel.
+
+## Layer A: Systematic edge-case suites (handwritten)
+For each feature area, write focused tests similar to the provided ones:
+- inverted markets funding math
+- dust + CloseSlab
+- fee overpayment trapping
+- warmup zombie PnL
+- pending_epoch wraparound
+- margin initial-vs-maintenance
+- LP flip entry-price
+- Hyperp mode validation and clamps
+- matcher init/call/double-init rejection
+- TradeCpi identity + PDA shape enforcement
+
+These are deterministic and must run in CI.
+
+## Layer B: Property-based sequence testing (seeded)
+Create a seeded test runner that generates short sequences of ops:
+- ops = {init_user, init_lp, deposit, withdraw, trade, crank, liquidate, close_account}
+- keep accounts small (1–3 users, 1–2 LPs)
+- cap sequence length (e.g., 10–50 ops) per run
+- always assert invariants after each step
+
+Use:
+- fixed RNG seed per test case
+- store failing seeds in `research/fuzz_corpus/` (gitignored)
+- when a seed reveals a real bug, convert it into a minimal deterministic integration test.
+
+## Layer C: Coverage-guided fuzzing (offline/local only)
+If available in your environment:
+- `cargo-fuzz` harness that drives LiteSVM with generated instruction sequences
+- define a compact "operation bytecode" format for fuzz input
+- auto-minimize crashing cases
+- export minimized cases to `research/failing_txs/`
+
+Again: **never commit fuzz corpus**.
+
+---
+
+# Market Configuration Matrix (Must Be Tested)
+
+Define a small but high-coverage matrix and run every suite across it:
+
+1) Standard oracle market:
+- invert=0
+- invert=1
+
+2) Standard + unit scale:
+- unit_scale = 0
+- unit_scale = 10 / 1000 (forces dust)
+
+3) Fees:
+- new_account_fee = 0
+- new_account_fee > 0 (test exact payment, underpayment, overpayment)
+
+4) Warmup:
+- warmup=0
+- warmup=100 (or similar)
+
+5) Hyperp:
+- feed_id=[0;32], initial_mark_price_e6 > 0, invert=0
+- feed_id=[0;32], initial_mark_price_e6 > 0, invert=1
+- cap default and cap customized
+
+6) Matcher:
+- Passive mode
+- vAMM mode with impact pricing
+- multiple LPs with independent contexts
+
+Implement this as:
+- `struct MarketConfig { ... }`
+- `for cfg in MARKET_CONFIGS { run_suite(cfg) }`
+
+---
+
+# "Only Commit Legit Bugs" Workflow
+
+## A bug is "legit" only if ALL are true
+1) **Reproducible** in LiteSVM with production BPF
+2) **Minimal**: you can explain and reproduce with a short integration test
+3) **Security impact**:
+   - fund loss, trapped funds, privilege escalation, invariant break that can be weaponized, or severe DoS
+4) **Reachable in well-config**:
+   - not dependent on obviously invalid configuration that InitMarket should reject
+5) **Non-flaky**
+6) **Fix path exists**
+   - either you implement it or you clearly isolate the required patch
+
+## When you think you found a bug
+You must do this *in order*:
+
+1) **Freeze evidence**
+- Copy the failing seed / sequence / logs into `research/bugs/WIP_<shortname>/` (gitignored)
+- Dump slab state before/after into `research/slab_dumps/`
+
+2) **Minimize**
+- remove steps until it still fails
+- remove extra accounts until minimal
+- reduce numeric magnitudes to smallest reproducer
+
+3) **Convert to an integration test**
+- Put it in `tests/integration_security_<area>.rs`
+- The test must fail on `main` (or current baseline) without your fix.
+
+4) **Root cause writeup (in commit or PR description)**
+- what invariant breaks
+- why it breaks (code path / arithmetic / account validation)
+- why it's exploitable (in the threat model above)
+
+5) **Patch + regression**
+- patch the code
+- ensure the new test passes
+- ensure existing suites pass
+
+## Commit message format
+`SECURITY: <short finding title> (repro + fix)`
+
+Body must include:
+- Impact
+- Conditions
+- Minimal reproduction test name
+- Fix summary
+
+---
+
+# Continuous Loop (What You Do Repeatedly)
+
+Each cycle (manual or automated) is:
+
+1) `git pull --rebase`
+2) `cargo build-sbf`
+3) Run all deterministic tests:
+   - `cargo test --test integration`
+   - `cargo test --test integration_security_oracle`
+   - `cargo test --test integration_security_margin`
+   - ...
+4) Run seeded property sequences:
+   - fixed seeds (baseline)
+   - rotating seeds (logged only to `research/`)
+5) If any invariant fails:
+   - minimize
+   - classify
+   - only promote to committed test if it meets "legit" criteria
+
+You must keep a daily journal entry in:
+- `research/journal/YYYY-MM-DD.md` (gitignored)
+
+Include:
+- what you tested
+- configs covered
+- seeds run
+- hypotheses explored
+- suspected issues (clearly marked "UNCONFIRMED")
+
+---
+
+# High-Value Bug Classes To Prioritize
+
+1) **Accounting / trapped funds**
+- dust buckets
+- fee overpayment and rounding
+- insurance fund mismatches
+- vault balance vs engine tracked balances
+
+2) **Margin and liquidation**
+- initial margin vs maintenance margin confusion
+- rounding errors in notional/margin computation
+- undercollateralized opens or over-withdraw
+- liquidation of solvent users
+
+3) **Oracle / price formation**
+- inversion paths (market price vs raw)
+- staleness/conf filters bypass
+- Hyperp mark/index divergence and cap bypass
+- exec_price manipulation via matcher in CPI flow
+
+4) **State machine / epoch wrap**
+- u8 epoch wraparound
+- warmup conversion starvation (zombie poisoning)
+- flip logic failing to update entry prices
+
+5) **CPI / PDA integrity**
+- wrong matcher program/context substitution
+- PDA shape spoofing
+- signer expectations (LP not signing in TradeCpi)
+- account owner/data length assumptions
+
+6) **DoS / compute / unbounded loops**
+- crank loops that can be forced into expensive scans
+- worst-case MAX_ACCOUNTS patterns
+- repeated small ops that grow state or cost
+
+---
+
+# Deliverables (What "Done" Looks Like)
+
+## For each confirmed finding you push
+You will deliver:
+- A new `#[test]` that fails on vulnerable code and passes on fixed code
+- A minimal patch
+- A concise writeup in commit message (or adjacent `SECURITY_FINDING_<id>.md` if your repo uses that)
+
+## For everything else
+You will keep:
+- full notes and evidence in `research/` (gitignored)
+- no commits, no pushes
+
+---
+
+# Non-Goals (Do Not Do These)
+
+- Do not publish exploit playbooks for production markets
+- Do not attempt mainnet/devnet exploitation
+- Do not commit noisy corpora, logs, or speculative "maybe-bugs"
+- Do not weaken tests to "pass"; tests must reflect real security properties
+
+---
+
+# Quick Start Checklist
+
+- [ ] Add `/research/` to `.gitignore`
+- [ ] Create `tests/common/mod.rs` and move shared harness code there
+- [ ] Add first security suites:
+  - [ ] oracle/inversion
+  - [ ] margin/initial-vs-maintenance
+  - [ ] accounting/dust + CloseSlab
+  - [ ] Hyperp validation + cap clamps
+  - [ ] TradeCpi identity + PDA shape
+- [ ] Implement invariant helpers and call them after every operation
+- [ ] Add seeded sequence runner with invariant checks
+- [ ] Only commit + push after "legit bug" criteria is met; and then run the plan

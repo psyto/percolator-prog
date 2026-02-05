@@ -656,6 +656,101 @@ Post-CPI validation:
 - Kani optimization: Transparent newtypes for verification
 - Sign handling: is_negative checks high bit of hi word
 
+## Continued Session 5 Exploration (Part 8)
+
+#### 50. Instruction Parsing Functions ✓
+**Location**: `percolator-prog/src/percolator.rs:1220-1298`
+**Status**: SECURE
+
+All read_* functions have proper length checks:
+- `read_u8`: Uses split_first().ok_or() - handles empty input
+- `read_u16`: Checks input.len() < 2
+- `read_u32`: Checks input.len() < 4
+- `read_u64`: Checks input.len() < 8
+- `read_i64`: Checks input.len() < 8
+- `read_i128`: Checks input.len() < 16
+- `read_u128`: Checks input.len() < 16
+- `read_pubkey`: Checks input.len() < 32
+- `read_bytes32`: Checks input.len() < 32
+- `read_risk_params`: Composed of other read functions
+
+All return `InvalidInstructionData` error on insufficient bytes.
+
+#### 51. slab_guard Validation ✓
+**Location**: `percolator-prog/src/percolator.rs:2151-2169`
+**Status**: SECURE
+
+- Called BEFORE any slab data operations in all instructions
+- Validates: slab.owner == program_id
+- Validates: data.len() == SLAB_LEN || data.len() == OLD_SLAB_LEN
+- Called in 20+ locations (all instruction handlers)
+- Prevents undersized slab attacks
+
+#### 52. State Serialization (bytemuck) ✓
+**Location**: `percolator-prog/src/percolator.rs:1351-1500`
+**Status**: SECURE
+
+- Uses bytemuck for safe Pod access (no unsafe)
+- SlabHeader, MarketConfig derive Pod + Zeroable
+- read_header/write_header use bytemuck::bytes_of_mut
+- Nonce/dust/threshold stored at fixed offsets via offset_of!
+- Compile-time assertion: `const _: [(); 48] = [(); RESERVED_OFF];`
+
+#### 53. InitMarket Security ✓
+**Location**: `percolator-prog/src/percolator.rs:2263-2412`
+**Status**: SECURE
+
+- slab_guard called before any writes
+- Re-initialization check: `if header.magic == MAGIC`
+- admin == signer validation
+- collateral_mint == account validation
+- Mint is real SPL Token (owner + length + unpack)
+- unit_scale validation via init_market_scale_ok
+- Hyperp mode: requires non-zero initial_mark_price_e6
+- Zeros all data before initialization
+- Clock-initializes slot fields to prevent overflow
+
+## Continued Session 5 Exploration (Part 9): Matcher Program
+
+#### 54. vAMM Matcher - lib.rs ✓
+**Location**: `percolator-match/src/lib.rs`
+**Status**: SECURE
+
+Entry point and dispatch:
+- Context account ownership validation (line 309)
+- LP PDA signature required for vAMM mode (line 325-327)
+- Legacy mode: stored PDA must match signer (line 338-341)
+- MatcherCall parsing: length check + reserved bytes must be zero
+- MatcherReturn: length check before write
+
+#### 55. vAMM Matcher - vamm.rs ✓
+**Location**: `percolator-match/src/vamm.rs`
+**Status**: SECURE
+
+Initialization (process_init_vamm):
+- Ownership + length + writable checks
+- Re-initialization protection (is_initialized check)
+- Parameter validation via ctx.validate()
+
+Input validation:
+- oracle_price_e6 == 0 rejected
+- req_size == i128::MIN rejected (abs overflow protection)
+
+Arithmetic safety:
+- All multiplications use checked_mul with ArithmeticOverflow error
+- Inventory uses saturating_add/saturating_sub
+- Result bounds checked (0, u64::MAX)
+
+Parameter validation:
+- vAMM: liquidity_notional_e6 != 0 required
+- max_total_bps <= 9000 (prevents underflow in BPS_DENOM - total_bps)
+- trading_fee_bps <= 1000
+- base_spread + fee <= max_total
+
+Inventory limits:
+- Proper direction handling (LP takes opposite side)
+- Boundary conditions handled correctly
+
 ## Known Open Issue
 
 **Bug #9**: Hyperp index smoothing bypass (clamp_toward_with_dt returns mark when dt=0)
