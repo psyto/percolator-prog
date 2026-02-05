@@ -3057,3 +3057,107 @@ Fixed budgets per crank:
 **Compute Budget**: Properly bounded
 
 All TradeCpi and oracle attack surfaces thoroughly defended with Kani-proven helper functions.
+
+---
+
+## Session 17 (2026-02-05 - Aggregate Consistency & State Machine)
+
+### Potential Vulnerability Investigation: LP Aggregate Update Ordering
+
+#### 211. LP Aggregate Desync via Early Return? ✓
+**Hypothesis**: Can LP aggregates (net_lp_pos, lp_sum_abs) desync if settle_warmup_to_capital fails?
+**Location**: `percolator/src/percolator.rs:1847-1855, 3056-3081`
+**Status**: SECURE (Solana Atomicity)
+
+Code pattern identified:
+```rust
+// Line 1847-1851: LP aggregates updated first
+if self.accounts[idx as usize].is_lp() {
+    self.net_lp_pos = self.net_lp_pos - pos + new_pos;
+    self.lp_sum_abs = self.lp_sum_abs - close_abs;
+}
+// Line 1855: Can return error
+self.settle_warmup_to_capital(idx)?;
+```
+
+Analysis:
+- If settle_warmup_to_capital returns Err, aggregates appear "modified"
+- BUT: Solana runtime reverts ALL account changes on instruction failure
+- Slab account (containing all engine state) is restored to pre-instruction state
+- No partial state updates survive an instruction error
+
+**Finding**: Solana transaction atomicity prevents aggregate desync
+
+#### 212. execute_trade Settlement Chain ✓
+**Hypothesis**: Can settlement chain failures cause state corruption?
+**Status**: SECURE (Solana Atomicity)
+
+Settlement chain in execute_trade:
+```rust
+// LP aggregates updated (lines 3059-3070)
+// Then settlement calls (lines 3077-3081):
+self.settle_loss_only(user_idx)?;
+self.settle_loss_only(lp_idx)?;
+self.settle_warmup_to_capital(user_idx)?;
+self.settle_warmup_to_capital(lp_idx)?;
+```
+
+Analysis:
+- If any settlement call fails, entire instruction fails
+- Solana reverts all account modifications
+- Position changes, fee deductions, aggregate updates all reverted atomically
+
+**Finding**: Four-step settlement chain is safe due to atomicity
+
+#### 213. Force-Realize on LP Accounts ✓
+**Hypothesis**: Is force-realize on LP accounts handled correctly?
+**Location**: `percolator/src/percolator.rs:1610-1628`
+**Status**: SECURE (Design Choice)
+
+Analysis:
+- Force-realize calls oracle_close_position_core for all account types
+- LP aggregates updated correctly within oracle_close_position_core
+- No special handling needed - LP is just another account for position closing
+- LP operators should be aware: positions can be force-closed during crisis
+
+**Finding**: Force-realize correctly handles LP accounts
+
+#### 214. set_capital and set_pnl Aggregate Maintenance ✓
+**Hypothesis**: Do set_capital/set_pnl always maintain aggregate consistency?
+**Status**: SECURE
+
+set_capital:
+- Computes delta = new_capital - old_capital
+- Updates c_tot atomically
+- No code path modifies capital without using set_capital
+
+set_pnl:
+- Computes delta in pnl_pos_tot correctly
+- Handles transitions: positive→negative, negative→positive
+- All PnL modifications use set_pnl
+
+**Finding**: Helpers ensure aggregate consistency by design
+
+### Solana Atomicity Deep Dive
+
+Key insight: Solana programs DO NOT have explicit rollback mechanisms because:
+1. Instructions execute within a transaction
+2. Runtime only commits account changes AFTER instruction succeeds
+3. If instruction returns Err, ALL account state reverts to pre-instruction
+4. This is true for: slab data, token accounts, all writable accounts
+
+This provides "free" atomicity for all engine operations:
+- No manual rollback code needed
+- Partial state updates impossible within single instruction
+- Error handling via `?` is safe
+
+## Session 17 Summary
+
+**Hypotheses Investigated**: 4
+**Actual Vulnerabilities Found**: 0
+**Key Insight**: Solana atomicity provides transaction-level rollback protection
+
+The identified code patterns (aggregate updates before fallible operations) are safe on Solana due to:
+- Instruction failure reverts all state
+- No partial commits possible
+- Aggregate consistency guaranteed by runtime
