@@ -124,3 +124,72 @@ All 57 integration tests pass.
 **Test Status**: All 57 integration tests pass
 
 The systematic search continues to find no new vulnerabilities. The codebase demonstrates comprehensive security measures across all reviewed areas.
+
+## Continued Exploration
+
+#### 13. Unsafe Code Containment ✓
+**Location**: `percolator-prog/src/percolator.rs:4, 819-858`
+**Status**: SECURE
+
+- `#![deny(unsafe_code)]` at top level
+- Only `mod zc` has `#[allow(unsafe_code)]`
+- Proper length and alignment checks before pointer operations
+- Lifetime soundness documented for invoke_signed_trade
+
+#### 14. Pyth Oracle Parsing ✓
+**Location**: `percolator-prog/src/percolator.rs:1615-1698`
+**Status**: SECURE
+
+- Owner validation (PYTH_RECEIVER_PROGRAM_ID)
+- Feed ID validation
+- Price > 0 check
+- Exponent bounded (MAX_EXPO_ABS)
+- Staleness check (disabled on devnet)
+- Confidence check (disabled on devnet)
+- Overflow check on multiplication
+- Zero price rejection
+- u64::MAX overflow check
+
+#### 15. Chainlink Oracle Parsing ✓
+**Location**: `percolator-prog/src/percolator.rs:1710-1787`
+**Status**: SECURE
+
+- Owner validation (CHAINLINK_OCR2_PROGRAM_ID)
+- Feed pubkey validation
+- Answer > 0 check
+- Decimals bounded (MAX_EXPO_ABS)
+- Staleness check (disabled on devnet)
+- Overflow check on multiplication
+- Zero price rejection
+- u64::MAX overflow check
+
+#### 16. Oracle Authority (Admin Oracle) ✓
+**Location**: `percolator-prog/src/percolator.rs:3450-3508`
+**Status**: SECURE
+
+SetOracleAuthority:
+- Admin-only
+- Clears stored price when authority changes
+- Zero authority = disabled
+
+PushOraclePrice:
+- Verifies caller == oracle_authority
+- Authority must be non-zero
+- Price must be positive
+- Circuit breaker applied (clamp_oracle_price)
+- Updates both authority_price_e6 and last_effective_price_e6
+
+#### 17. SetOraclePriceCap ✓
+**Location**: `percolator-prog/src/percolator.rs:3510-3528`
+**Status**: SECURE
+
+- Admin-only
+- No validation needed (any u64 is valid; 0 = disabled)
+
+## Session 5 Final Summary
+
+**Total Areas Verified This Session**: 17
+**New Vulnerabilities Found**: 0
+**All 57 Integration Tests**: PASS
+
+The codebase continues to demonstrate strong security practices with comprehensive validation, authorization, overflow protection, and proper error handling across all 17 additional areas reviewed.
