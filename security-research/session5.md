@@ -394,10 +394,63 @@ O(1) aggregate maintenance:
 - set_capital: Updates c_tot (delta-based update)
 - All code paths modifying PnL/capital MUST use these helpers
 
+## Continued Session 5 Exploration (Part 5)
+
+#### 34. touch_account ✓
+**Location**: `percolator/src/percolator.rs:2222-2241`
+**Status**: SECURE
+
+- Validates account exists
+- Calls settle_account_funding
+- Updates pnl_pos_tot aggregate for funding settlement
+
+#### 35. settle_account_funding ✓
+**Location**: `percolator/src/percolator.rs:2180-2219`
+**Status**: SECURE
+
+- delta_f = global_fi - account.funding_index (checked_sub)
+- payment = position × delta_f / 1e6 (checked_mul/checked_div)
+- Rounds UP for positive payments (account pays)
+- Truncates for negative (account receives)
+- Updates pnl and funding_index
+
+#### 36. settle_mark_to_oracle ✓
+**Location**: `percolator/src/percolator.rs:2251-2280`
+**Status**: SECURE
+
+- Zero position: sets entry = oracle for determinism
+- Computes mark_pnl via mark_pnl_for_position (checked math)
+- Realizes mark PnL via set_pnl (maintains aggregate)
+- Sets entry_price = oracle_price
+- Best-effort variant uses saturating_add (for liquidation paths)
+
+#### 37. accrue_funding ✓
+**Location**: `percolator/src/percolator.rs:2106-2151`
+**Status**: SECURE
+
+- dt = 0 returns early (no double-accrual)
+- Oracle price validation (0 < price <= MAX_ORACLE_PRICE)
+- Uses STORED rate (anti-retroactivity guarantee)
+- Rate capped at ±10,000 bps/slot
+- dt capped at ~1 year (31,536,000 slots)
+- ΔF = price × rate × dt / 10,000 with checked_mul/checked_div
+- funding_index_qpb_e6 updated with checked_add (returns Overflow on fail)
+
+#### 38. touch_account_full ✓
+**Location**: `percolator/src/percolator.rs:2316-2356`
+**Status**: SECURE
+
+Lazy settlement pipeline:
+1. Settle funding (touch_account)
+2. Settle mark-to-oracle (with warmup reset if AvailGross increases)
+3. Settle maintenance fees
+4. Settle warmup (convert PnL to capital)
+5. Sweep fee debt from capital
+
 ## Session 5 Final Summary (Updated)
 
-**Total Areas Verified This Session**: 33
+**Total Areas Verified This Session**: 38
 **New Vulnerabilities Found**: 0
 **All 57 Integration Tests**: PASS
 
-The codebase continues to demonstrate strong security practices with comprehensive validation, authorization, overflow protection, and proper error handling across all 33 additional areas reviewed.
+The codebase continues to demonstrate strong security practices with comprehensive validation, authorization, overflow protection, and proper error handling across all 38 additional areas reviewed.
