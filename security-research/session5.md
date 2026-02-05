@@ -1860,3 +1860,184 @@ Expected behavior:
 **New Vulnerabilities Found**: 0
 **MEV Defenses**: Comprehensive
 **Economic Attack Analysis**: Complete
+
+---
+
+## Session 9 (2026-02-05 continued)
+
+### Cross-Instruction State Consistency Analysis
+
+#### 135. Aggregate Synchronization in execute_trade ✓
+**Location**: `percolator/src/percolator.rs:3011-3087`
+**Status**: SECURE (Solana atomicity)
+
+Analysis:
+- Aggregates (c_tot, pnl_pos_tot) committed before settlement
+- Settlement calls (settle_loss_only, settle_warmup_to_capital) can modify aggregates
+- Creates temporary window of staleness
+
+Defense:
+- Solana transaction atomicity prevents partial completion
+- Either ALL state changes apply or NONE
+- No external observation of intermediate state
+
+**Risk**: None (protected by Solana atomicity)
+
+#### 136. Insurance/Capital Aggregate Updates ✓
+**Location**: `percolator/src/percolator.rs:1059-1063`
+**Status**: SECURE (Solana atomicity)
+
+Pattern verified:
+- capital -= pay, insurance += pay, c_tot -= pay
+- Sequential updates within same instruction
+- Invariant: vault >= c_tot + insurance maintained
+
+**Risk**: None (atomic instruction execution)
+
+#### 137. num_used_accounts Counter ✓
+**Location**: `percolator/src/percolator.rs:867-877, 1329-1334`
+**Status**: SECURE
+
+Pattern:
+- Incremented on alloc_slot (saturating_add)
+- Decremented on free_slot (saturating_sub)
+- Counter tracks bitmap state
+
+**Risk**: Low (saturating arithmetic prevents desync)
+
+#### 138. LP Aggregate Maintenance ✓
+**Location**: `percolator/src/percolator.rs:1845-1852`
+**Status**: SECURE
+
+LP aggregates updated atomically:
+- net_lp_pos: uses old pos value correctly
+- lp_sum_abs: decremented by close_abs
+- lp_max_abs: monotone upper bound (never decreased)
+
+**Risk**: None (correct delta-based updates)
+
+### Integer Boundary Condition Analysis
+
+#### 139. i128::MIN Handling ✓
+**Location**: `percolator/src/percolator.rs:530-535`
+**Status**: SECURE
+
+```rust
+fn saturating_abs_i128(val: i128) -> i128 {
+    if val == i128::MIN { i128::MAX }
+    else { val.abs() }
+}
+```
+
+Guards:
+- Position size i128::MIN explicitly rejected at lines 2712, 2765
+- Kani proof validates rejection
+- saturating_abs_i128 handles all values safely
+
+**Risk**: None (comprehensive guards)
+
+#### 140. Position × Price Overflow ✓
+**Location**: `percolator/src/percolator.rs:1705-1708`
+**Status**: SECURE (proven)
+
+Math proof:
+```
+max_position = 10^20
+max_price = 10^15
+product = 10^35 << i128::MAX (1.7 × 10^38)
+```
+
+Uses checked_mul with explicit Overflow error return.
+
+**Risk**: None (mathematically proven safe)
+
+#### 141. MAX_ORACLE_PRICE Enforcement ✓
+**Location**: Multiple (lines 1492, 1953, 2113, 2467, 2707, 2756)
+**Status**: SECURE
+
+Six validation points:
+- Oracle price read (external feeds)
+- Oracle price push (admin)
+- Trade execution price
+- All reject price > 10^15 or price == 0
+
+**Risk**: None (defense in depth)
+
+#### 142. MAX_POSITION_ABS Enforcement ✓
+**Location**: Lines 2715, 2768, 2851-2852
+**Status**: SECURE
+
+Three-layer validation:
+1. Input size check
+2. Exec size check
+3. Final position bounds check
+
+All use saturating_abs_i128 before comparison.
+
+**Risk**: None (three-layer defense)
+
+#### 143. Fee Calculation Safety ✓
+**Location**: `percolator/src/percolator.rs:2822-2824`
+**Status**: SECURE (with note)
+
+```rust
+(mul_u128(notional, fee_bps) + 9999) / 10_000
+```
+
+- mul_u128 uses saturating multiplication
+- Ceiling division ensures minimum 1 unit fee
+- trading_fee_bps set at InitMarket (not updatable)
+
+**Note**: No explicit upper bound on trading_fee_bps
+**Mitigation**: Admin-only parameter, economically nonsensical to set > 10000
+
+**Risk**: Low (admin misconfiguration only)
+
+#### 144. Division Safety ✓
+**Location**: Multiple
+**Status**: SECURE
+
+All divisions use either:
+- Constant divisors (1_000_000, 10_000)
+- Explicit zero checks before division
+- Defensive guards for edge cases
+
+**Risk**: None (comprehensive guards)
+
+#### 145. BPF-Safe I128 Negation ✓
+**Location**: `percolator/src/i128.rs:910`
+**Status**: SECURE (unused in critical paths)
+
+Analysis:
+- Neg trait uses raw -self.get()
+- Could panic on i128::MIN
+- BUT: Subtraction uses saturating_sub, not negation
+- Neg operator not used in consensus-critical code
+
+**Risk**: None (not invoked)
+
+### State Consistency Summary
+
+| Pattern | Status | Protection |
+|---------|--------|------------|
+| Aggregate sync in execute_trade | SECURE | Solana atomicity |
+| Insurance/capital updates | SECURE | Solana atomicity |
+| num_used_accounts counter | SECURE | Saturating ops |
+| LP aggregate maintenance | SECURE | Delta updates |
+
+### Integer Boundary Summary
+
+| Boundary | Value | Status | Guards |
+|----------|-------|--------|--------|
+| i128::MIN | -2^127 | SECURE | saturating_abs, validation |
+| MAX_POSITION_ABS | 10^20 | SECURE | 3-layer validation |
+| MAX_ORACLE_PRICE | 10^15 | SECURE | 6 validation points |
+| Position × Price | 10^35 | SECURE | checked_mul, proven safe |
+| Fee calculation | varies | SECURE | saturating mul, ceiling div |
+
+## Session 9 Summary
+
+**Total Areas Verified**: 145
+**New Vulnerabilities Found**: 0
+**State Consistency**: Protected by Solana atomicity
+**Integer Boundaries**: Comprehensive guards in place
