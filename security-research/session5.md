@@ -1227,3 +1227,207 @@ The codebase continues to demonstrate robust security practices. All identified 
 | State Management | 12 | ✓ |
 
 **Conclusion**: No security vulnerabilities found beyond Bug #9 which has been fixed. The Percolator protocol demonstrates production-ready security practices.
+
+---
+
+## Session 7 (2026-02-05 continued)
+
+### DoS/Compute Analysis & Additional Edge Cases
+
+#### 93. Crank Loop Bounds ✓
+**Location**: `percolator/src/percolator.rs:1559-1646`
+**Status**: SECURE
+
+- `accounts_processed < ACCOUNTS_PER_CRANK` (256) limits iteration
+- `slots_scanned < MAX_ACCOUNTS` (4096) bounds scan
+- `LIQ_BUDGET_PER_CRANK` = 120 limits liquidations per crank
+- `FORCE_REALIZE_BUDGET_PER_CRANK` = 32 limits force-realize
+- No unbounded loops - compute budget protected
+
+#### 94. GC Bounds ✓
+**Location**: `percolator/src/percolator.rs:1351-1425`
+**Status**: SECURE
+
+- `GC_CLOSE_BUDGET` = 32 limits closures per call
+- `max_scan = min(ACCOUNTS_PER_CRANK, MAX_ACCOUNTS)` bounds iteration
+- LPs never GCed (explicit check)
+- Cursor advances even if no work done
+
+#### 95. Account ID Uniqueness ✓
+**Location**: `percolator/src/percolator.rs:917-978`
+**Status**: SECURE
+
+- `next_account_id` monotonically increasing
+- Uses `saturating_add(1)` to prevent overflow
+- IDs never recycled (comment explicit)
+- `free_slot` clears to `empty_account()` with id=0
+- New accounts get fresh unique ID on alloc
+
+#### 96. Matcher Return Value Validation ✓
+**Location**: `percolator/src/percolator.rs:2751-2780`
+**Status**: SECURE
+
+- `exec_price`: != 0, <= MAX_ORACLE_PRICE
+- `exec_size`: != 0 (no-op), != i128::MIN, <= MAX_POSITION_ABS
+- Direction match: `(exec_size > 0) == (size > 0)`
+- Partial fill only: `abs(exec_size) <= abs(size)`
+- Trade PnL uses oracle_price as reference (matcher can't manipulate valuation)
+
+#### 97. Hyperp exec_price Clamping ✓
+**Location**: `percolator-prog/src/percolator.rs:3115-3124`
+**Status**: SECURE
+
+- After TradeCpi, exec_price clamped via `clamp_oracle_price`
+- Clamped against current index (last_effective_price_e6)
+- Same circuit breaker cap as PushOraclePrice
+- Mark price can't jump more than cap per slot
+
+#### 98. TradeNoCpi Blocked in Hyperp ✓
+**Location**: `percolator-prog/src/percolator.rs:2842-2846`
+**Status**: SECURE
+
+- `is_hyperp_mode(&config)` check returns `HyperpTradeNoCpiDisabled`
+- All Hyperp trades must use TradeCpi with pinned matcher
+- Prevents direct mark price manipulation
+- Comment explains rationale
+
+#### 99. Funding Rate Clamping ✓
+**Location**: `percolator-prog/src/percolator.rs:178-220, 1993-2020`
+**Status**: SECURE
+
+Inventory-based (`compute_inventory_funding_bps_per_slot`):
+- Premium capped at `funding_max_premium_bps` (default 500 = 5%)
+- Per-slot capped at `funding_max_bps_per_slot` (default 5)
+- Sanity clamp at ±10,000 bps/slot
+
+Premium-based (`compute_premium_funding_bps_per_slot`):
+- Premium = (mark - index) / index
+- Clamped at ±max_premium_bps
+- K multiplier applied (100 = 1.00x)
+- Final per-slot clamp
+
+Anti-retroactivity: stored rate used for accrual, new rate for next interval
+
+#### 100. Oracle Staleness ✓
+**Location**: `percolator-prog/src/percolator.rs:1656-1665, 1755-1764`
+**Status**: SECURE
+
+- Pyth: `age = now_unix_ts - publish_time`, must be <= `max_staleness_secs`
+- Chainlink: Same pattern with timestamp
+- Authority price: Same staleness check
+- **Warning**: `devnet` feature disables checks - documented as dangerous
+- Age < 0 also rejected (future timestamps)
+
+## Session 7 Summary
+
+**New Areas Verified**: 8 (93-100)
+**Total Areas Verified**: 100
+**New Vulnerabilities Found**: 0
+**All 57 Integration Tests**: PASS
+
+### Key Findings
+
+1. **Compute Budget**: All loops are properly bounded with explicit budgets per operation
+2. **Account Management**: IDs never recycled, GC properly scoped, LPs protected
+3. **Matcher Trust Boundary**: Strict validation of return values, oracle used for valuation
+4. **Hyperp Protection**: Multiple layers (TradeNoCpi blocked, exec_price clamped)
+5. **Funding Rate**: Multi-layer clamping prevents manipulation
+6. **Oracle Freshness**: Staleness enforced except in devnet mode
+
+The protocol continues to show robust security architecture with defense-in-depth patterns.
+
+#### 101. Position Limits ✓
+**Location**: `percolator/src/percolator.rs:65-68, 2715-2716, 2851-2854`
+**Status**: SECURE
+
+- MAX_POSITION_ABS = 10^20 (100 billion units)
+- Checked on input size, exec_size, and final positions
+- Designed to prevent overflow in mark_pnl (position * price)
+- Combined with MAX_ORACLE_PRICE for i128 safety
+
+#### 102. Margin Calculation Edge Cases ✓
+**Location**: `percolator/src/percolator.rs:2534-2548, 2957-3008`
+**Status**: SECURE
+
+- initial_margin_bps for risk-increasing trades
+- initial_margin_bps for position flips (crosses_zero)
+- maintenance_margin_bps for risk-reducing trades
+- Notional calculations use mul_u128 (overflow-safe)
+- Ceiling division for fees prevents micro-trade evasion
+
+#### 103. Haircut Calculation Precision ✓
+**Location**: `percolator/src/percolator.rs:812-844, 2890-2926`
+**Status**: SECURE
+
+- h_num = min(residual, pnl_pos_tot), h_den = pnl_pos_tot
+- Returns (1, 1) when pnl_pos_tot == 0 (no division by zero)
+- floor(pos_pnl * h_num / h_den) for effective_pos_pnl
+- **Projected haircut**: Uses post-trade pnl_pos_tot in margin checks
+- Haircut computed BEFORE modifying PnL/capital
+
+#### 104. Two-Pass Settlement ✓
+**Location**: `percolator/src/percolator.rs:3072-3085`
+**Status**: SECURE
+
+- settle_loss_only first (increases Residual)
+- Then settle_warmup_to_capital (profit conversion)
+- Ensures loser's capital reduction reflects before winner reads haircut
+- Fixes Finding G (winner's profit incorrectly haircutted to 0)
+
+#### 105. Signer Validation Patterns ✓
+**Location**: `percolator-prog/src/percolator.rs:1314-1319`
+**Status**: SECURE
+
+- `expect_signer` uses `signer_ok` helper (Kani-provable)
+- All instructions properly check signers
+- TradeCpi: user signs, LP delegated to matcher (by design)
+- Admin ops require admin signer
+- `allow_panic` requires admin signer (prevents griefing)
+
+#### 106. PDA Derivation Safety ✓
+**Location**: `percolator-prog/src/percolator.rs:1345-1346, 2936-2939`
+**Status**: SECURE
+
+Vault PDA: `["vault", slab_key]`
+- Unique per slab
+- Used for token transfers
+
+LP PDA: `["lp", slab_key, lp_idx]`
+- Unique per LP per slab
+- Used for matcher CPI signing
+
+No collision risk:
+- Different prefixes prevent cross-type collision
+- Both include slab_key for market isolation
+
+#### 107. Lamport Safety ✓
+**Location**: `percolator-prog/src/percolator.rs:2948, 3375-3381`
+**Status**: SECURE
+
+LP PDA validation:
+- Requires `lamports_zero` (can't fund PDA to fake ownership)
+
+CloseSlab lamport transfer:
+- Only after validation (vault=0, insurance=0, accounts=0, dust=0)
+- Uses `checked_add` for overflow protection
+- Data zeroed before transfer (prevents reuse)
+
+#### 108. CloseSlab Validation ✓
+**Location**: `percolator-prog/src/percolator.rs:3345-3373`
+**Status**: SECURE (without unsafe_close)
+
+Checks before close:
+1. Admin authorization
+2. `engine.vault.is_zero()` - no tokens
+3. `engine.insurance_fund.balance.is_zero()` - no insurance
+4. `engine.num_used_accounts == 0` - all accounts closed
+5. `dust_base == 0` - no dust (Bug #3 fix)
+6. Data zeroed before lamport transfer
+
+**Warning**: `unsafe_close` feature skips ALL validation
+
+## Session 7 Summary (Updated)
+
+**Total Areas Verified**: 108
+**New Vulnerabilities Found**: 0
+**All 57 Integration Tests**: PASS
