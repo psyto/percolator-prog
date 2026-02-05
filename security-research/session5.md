@@ -3475,12 +3475,197 @@ All dust and edge case handling is robust with:
 
 ---
 
-## COMPREHENSIVE SECURITY RESEARCH COMPLETE (Sessions 5-20)
+## Session 21: Cross-Instruction and Race Condition Deep Dive
+
+**Date**: 2026-02-05
+**Focus**: Cross-instruction state manipulation, race conditions, reentrancy
+
+#### 235. CPI Reentrancy Prevention ✓
+**Location**: `percolator-prog/src/percolator.rs:3045-3126`
+**Status**: SECURE
+
+Attack: Malicious matcher calls back into Percolator during CPI.
+
+Defenses:
+- Slab NOT passed to CPI (avoids ExternalAccountDataModified)
+- Immutable borrow for reads before CPI
+- State modification ONLY after CPI returns
+- Explicit drop() statements to release borrows
+
+**Finding**: Read/write separation prevents CPI reentrancy
+
+#### 236. Account Closure Race ✓
+**Location**: `percolator-prog/src/percolator.rs:3333-3382`
+**Status**: SECURE (Solana Atomicity)
+
+Attack: Close slab while another instruction uses it.
+
+Defenses:
+- Solana transactions are atomic
+- CloseSlab validates complete state before closing
+- Data zeroed after validation
+- Lamports drained for non-rent-exemption
+
+**Finding**: Atomic transactions eliminate race window
+
+#### 237. Reinitialization Prevention ✓
+**Location**: `percolator-prog/src/percolator.rs:2340-2347`
+**Status**: SECURE
+
+Attack: Reinitialize market to reset state.
+
+Defense:
+```rust
+if header.magic == MAGIC { return Err(AlreadyInitialized); }
+```
+
+**Finding**: Magic check prevents all reinitialization
+
+#### 238. Account Index Staleness ✓
+**Location**: `percolator-prog/src/percolator.rs:2193-2198`
+**Status**: SECURE
+
+Attack: Use GC'd account index.
+
+Defense: check_idx() called fresh every instruction:
+- Deposit (line 2527)
+- Withdraw (line 2580)
+- TradeNoCpi (lines 2854-2855)
+- TradeCpi (lines 2970-2971)
+- LiquidateAtOracle (line 3155)
+- CloseAccount (line 3227)
+
+**Finding**: Fresh validity check prevents stale index use
+
+#### 239. PDA Collision Prevention ✓
+**Location**: `percolator-prog/src/percolator.rs:2936-2952`
+**Status**: SECURE
+
+Attack: PDA collision or wrong PDA.
+
+Defenses:
+- Deterministic seeds: `["lp", slab_key, lp_idx, bump]`
+- Expected PDA derived and compared
+- PDA shape validated (system-owned, zero data/lamports)
+- verify::pda_key_matches with Kani proofs
+
+**Finding**: Multi-layer PDA validation prevents substitution
+
+#### 240. Account Reuse After Close ✓
+**Location**: `percolator-prog/src/percolator.rs:3186-3259`
+**Status**: SECURE
+
+Attack: Reuse closed account index.
+
+Defenses:
+- engine.close_account() marks unused via is_used()
+- check_idx() rejects unused indices
+- No reactivation instruction exists
+- CloseSlab zeros entire slab
+
+**Finding**: Closed accounts permanently removed from active set
+
+#### 241. Account Aliasing Prevention ✓
+**Location**: All instruction handlers
+**Status**: SECURE
+
+Attack: Pass same account for multiple parameters.
+
+Defenses:
+- accounts::expect_len() verifies exact count
+- Distinct roles (user, slab, vault, oracle)
+- Different owners prevent aliasing
+- PDA validation for program-owned accounts
+
+**Finding**: Ownership + role checks prevent aliasing
+
+#### 242. Double-Borrow Prevention ✓
+**Location**: `percolator-prog/src/percolator.rs:2642-2726`
+**Status**: SECURE (Rust Borrow Checker)
+
+Attack: Modify same state twice.
+
+Defenses:
+- Rust borrow checker prevents at compile time
+- Explicit drop() statements
+- Comments document borrow order
+- Immutable borrows before mutable
+
+**Finding**: Compile-time + runtime protection
+
+#### 243. Matcher Identity Binding ✓
+**Location**: `percolator-prog/src/percolator.rs:2987-2995`
+**Status**: SECURE
+
+Attack: Substitute fake matcher program.
+
+Defenses:
+- Matcher identity stored at InitLP
+- verify::matcher_identity_ok compares stored vs provided
+- ABI validation echoes req_id, lp_account_id, oracle_price_e6
+- Nonce prevents replay of old responses
+
+**Finding**: 4-layer validation prevents matcher substitution
+
+#### 244. Input Injection Prevention ✓
+**Location**: `percolator-prog/src/percolator.rs:1101-1175`
+**Status**: SECURE
+
+Attack: Malformed instruction data.
+
+Defenses:
+- Account count verified per instruction
+- Data length checks in all read_* functions
+- Numerical parameter bounds enforced
+- Address/key validation against signers
+
+**Finding**: Comprehensive input validation
+
+#### 245. Oracle Feed Validation ✓
+**Location**: `percolator-prog/src/percolator.rs:1614-1752`
+**Status**: SECURE
+
+Attack: Fake/stale oracle feed.
+
+Defenses:
+- Feed type detection by owner
+- Pyth: product active, confidence filter
+- Chainlink: answer count, bounds, staleness
+- Circuit breaker caps price change per slot
+
+**Finding**: Multi-layer oracle validation + circuit breaker
+
+#### 246. Feature Flag Security ✓
+**Location**: `percolator-prog/src/percolator.rs:3341-3373`
+**Status**: SECURE (if properly deployed)
+
+Dangerous flags:
+- `unsafe_close`: Skips all CloseSlab validation
+- `devnet`: Disables oracle staleness/confidence
+
+**Finding**: Must be gated at deployment, code includes warnings
+
+## Session 21 Summary
+
+**Cross-Instruction Attack Vectors Analyzed**: 12
+**Critical Vulnerabilities Found**: 0
+**Key Defense Mechanisms**: Solana atomicity, borrow checker, identity binding
+
+Race condition and cross-instruction attacks comprehensively mitigated by:
+- Solana's atomic transaction model
+- Rust's borrow checker (compile-time safety)
+- Fresh state reads every instruction
+- Multi-layer validation (check_idx, PDA, identity, ABI)
+- Explicit CPI borrow management
+
+---
+
+## COMPREHENSIVE SECURITY RESEARCH COMPLETE (Sessions 5-21)
 
 ### Final Statistics
 
-**Total Sessions**: 16 (Sessions 5-20)
-**Total Areas Verified**: 234
+**Total Sessions**: 17 (Sessions 5-21)
+**Total Areas Verified**: 246
 **Critical Vulnerabilities Found**: 0
 **Open Issues**: 0
 
@@ -3502,13 +3687,14 @@ All dust and edge case handling is robust with:
 | TradeCpi Layers | 4 | ✓ VERIFIED |
 | Novel Attack Vectors | 20+ | ✓ TESTED |
 | Dust/Edge Cases | 8 | ✓ VERIFIED |
+| Cross-Instruction/Race | 12 | ✓ VERIFIED |
 
 ### Verification Methods
 
 - 271 Kani formal proofs
 - 57 integration tests (all pass)
 - 21 proptest fuzzing tests
-- Manual code review (234 areas)
+- Manual code review (246 areas)
 - Novel attack hypothesis testing (20+ vectors)
 
 ### Conclusion
