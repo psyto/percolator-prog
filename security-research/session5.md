@@ -447,10 +447,62 @@ Lazy settlement pipeline:
 4. Settle warmup (convert PnL to capital)
 5. Sweep fee debt from capital
 
+## Continued Session 5 Exploration (Part 6)
+
+#### 39. WithdrawCollateral (wrapper) ✓
+**Location**: `percolator-prog/src/percolator.rs:2534-2612`
+**Status**: SECURE
+
+- Signer/writable/slab_guard checks
+- PDA derivation and validation
+- Oracle price read (Hyperp or circuit-breaker clamped)
+- check_idx + owner_ok authorization
+- Rejects misaligned withdrawals (unit_scale)
+- Calls engine.withdraw() for margin check
+- Token transfer via collateral::withdraw
+
+#### 40. engine.withdraw ✓
+**Location**: `percolator/src/percolator.rs:2456-2574`
+**Status**: SECURE
+
+Timing guards:
+- require_fresh_crank
+- require_recent_full_sweep
+
+Validations:
+- Oracle price bounds (0 < price <= MAX)
+- Account exists
+- touch_account_full for settlement
+- Sufficient capital check
+
+MTM equity with haircut:
+- Uses effective_pos_pnl (haircut-adjusted)
+- Adds mark_pnl from mark_pnl_for_position
+- Overflow defaults to 0 equity (fail-safe)
+- Subtracts fee debt
+
+Margin checks:
+- **Pre-withdrawal**: Initial margin check
+- **Post-withdrawal**: Maintenance margin check
+- If post-check fails, REVERTS via set_capital
+
+#### 41. engine.deposit ✓
+**Location**: `percolator/src/percolator.rs:2396-2452`
+**Status**: SECURE
+
+- Updates current_slot
+- Validates account exists
+- Calculates and settles accrued fees
+- Pays owed fees from deposit first
+- Vault gets full deposit
+- Capital gets remainder via set_capital
+- Calls settle_warmup_to_capital
+- Calls pay_fee_debt_from_capital
+
 ## Session 5 Final Summary (Updated)
 
-**Total Areas Verified This Session**: 38
+**Total Areas Verified This Session**: 41
 **New Vulnerabilities Found**: 0
 **All 57 Integration Tests**: PASS
 
-The codebase continues to demonstrate strong security practices with comprehensive validation, authorization, overflow protection, and proper error handling across all 38 additional areas reviewed.
+The codebase continues to demonstrate strong security practices with comprehensive validation, authorization, overflow protection, and proper error handling across all 41 additional areas reviewed.
