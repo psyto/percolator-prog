@@ -2953,3 +2953,107 @@ All explored attack vectors are properly defended through:
 - Unique account IDs (no index reuse confusion)
 - Economic disincentives (attacker loses capital)
 - Permissionless design (no extraction from liquidation)
+
+---
+
+## Session 16 (2026-02-05 - TradeCpi & Oracle Deep Dive)
+
+### TradeCpi Security Analysis
+
+#### 204. Matcher Shape Validation ✓
+**Location**: `percolator-prog/src/percolator.rs:2924-2931`
+**Status**: SECURE
+
+Four-point validation:
+1. `prog_executable` - matcher program must be executable
+2. `!ctx_executable` - context must NOT be executable
+3. `ctx_owner_is_prog` - context must be owned by matcher program
+4. `ctx_len_ok` - context must have sufficient length (320 bytes)
+
+**Finding**: All checks are Kani-proven, prevents account shape attacks
+
+#### 205. LP PDA Validation ✓
+**Location**: `percolator-prog/src/percolator.rs:2934-2952`
+**Status**: SECURE
+
+Three-point validation:
+1. PDA key matches expected derivation `["lp", slab, lp_idx]`
+2. System-owned (prevents fake PDAs with data)
+3. Zero data and zero lamports
+
+**Finding**: Cryptographically unforgeable PDA with strict shape requirements
+
+#### 206. Matcher Identity Binding ✓
+**Location**: `percolator-prog/src/percolator.rs:2987-2995`
+**Status**: SECURE
+
+Byte-for-byte comparison:
+- `lp_matcher_prog` (registered at InitLP) == provided program
+- `lp_matcher_ctx` (registered at InitLP) == provided context
+
+**Finding**: LP cannot use different matcher than registered - immutable binding
+
+#### 207. ABI Echo Validation ✓
+**Location**: `matcher_abi::validate_matcher_return`
+**Status**: SECURE
+
+Matcher must echo back:
+- `req_id` (nonce) - prevents replay
+- `lp_account_id` - binds to specific LP
+- `oracle_price_e6` - ensures price consistency
+
+**Finding**: Prevents replay attacks and response substitution
+
+### Oracle Security Analysis
+
+#### 208. Pyth Oracle Parsing ✓
+**Location**: `percolator-prog/src/percolator.rs:1615-1690`
+**Status**: SECURE
+
+Comprehensive validation:
+1. Owner check (PYTH_RECEIVER_PROGRAM_ID)
+2. Length check (min 134 bytes)
+3. Feed ID validation (32-byte match)
+4. Price positive check
+5. Exponent bounds (±18 max)
+6. Staleness check (age validation)
+7. Confidence filter (bps threshold)
+8. Overflow-safe conversion (checked_mul)
+
+**Finding**: Multi-layer oracle validation prevents manipulation
+
+#### 209. Matcher Program Upgrade Attack ✓
+**Hypothesis**: Can LP be exploited if registered matcher program is upgraded maliciously?
+**Status**: DESIGN LIMITATION (Documented)
+
+Analysis:
+- Solana BPF upgradeable programs can be upgraded by authority
+- Program ID stays same, code changes
+- LP must trust matcher program AND its upgrade authority
+- Percolator cannot control external program upgrades
+
+**Mitigation**: Admin/LP responsibility to only register trusted matchers
+
+**Finding**: Known risk, documented as admin responsibility
+
+### Compute Budget Protection
+
+#### 210. Crank Budget Bounds ✓
+**Status**: SECURE
+
+Fixed budgets per crank:
+- `ACCOUNTS_PER_CRANK = 256` - max accounts processed
+- `GC_CLOSE_BUDGET = 32` - max GC operations
+- `LIQ_BUDGET_PER_CRANK = 120` - max liquidations
+- `FORCE_REALIZE_BUDGET_PER_CRANK = 32` - max force-realize
+
+**Finding**: Worst-case CU under 50% of Solana limit
+
+## Session 16 Summary
+
+**Areas Analyzed**: 7
+**TradeCpi Layers Verified**: 4 (shape, PDA, identity, ABI)
+**Oracle Checks Verified**: 8 (comprehensive validation)
+**Compute Budget**: Properly bounded
+
+All TradeCpi and oracle attack surfaces thoroughly defended with Kani-proven helper functions.
