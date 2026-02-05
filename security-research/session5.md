@@ -871,11 +871,39 @@ Consistent pattern across all instructions:
 - Owner validation: Slab (program), vault (spl_token), oracle (Pyth/CL)
 - LP PDA: system-owned, zero data, zero lamports
 
-## Session 5 Final Summary (Part 13)
+## Continued Session 5 Exploration (Part 14)
 
-**Total Areas Verified This Session**: 65
+#### 66. Proptest Fuzzing Suite ✓
+**Location**: `percolator/tests/fuzzing.rs` (1554 lines)
+**Status**: SECURE (comprehensive coverage)
+
+Verified invariants:
+- Conservation: vault >= C_tot + sum(settled_pnl) + insurance
+- Aggregate consistency: c_tot, pnl_pos_tot match account sums
+- reserved_pnl <= max(0, pnl) for each account
+
+Properties tested:
+- Withdrawable PnL monotone in slot
+- Withdrawable = 0 when pnl <= 0 or slope = 0
+- Settle warmup idempotent at same slot
+- Touch account idempotent when global index unchanged
+- Funding with dt=0 is no-op
+- Zero position pays no funding
+- Funding is zero-sum (change <= 0, bounded)
+- Add fails at max capacity
+
+State machine fuzzer:
+- Simulates Solana atomicity (rollback on error)
+- Selector-based actions (Existing, ExistingNonLp, Lp, Random)
+- 21 proptest tests pass (500+ cases each)
+- Deterministic fuzzer with 500 seeds × 200 steps
+
+## Session 5 Final Summary (Part 14)
+
+**Total Areas Verified This Session**: 66
 **New Vulnerabilities Found**: 0
 **All 57 Integration Tests**: PASS
+**Proptest Suite**: 21 tests pass
 
 ## Known Open Issue
 
