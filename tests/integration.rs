@@ -4390,6 +4390,67 @@ impl TradeCpiTestEnv {
         }
         i128::from_le_bytes(slab_data[account_off..account_off+16].try_into().unwrap())
     }
+
+    fn try_close_account(&mut self, owner: &Keypair, user_idx: u16) -> Result<(), String> {
+        let ata = self.create_ata(&owner.pubkey(), 0);
+        let (vault_pda, _) = Pubkey::find_program_address(&[b"vault", self.slab.as_ref()], &self.program_id);
+
+        let ix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(owner.pubkey(), true),
+                AccountMeta::new(self.slab, false),
+                AccountMeta::new(ata, false),
+                AccountMeta::new(self.vault, false),
+                AccountMeta::new_readonly(vault_pda, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(sysvar::clock::ID, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
+            ],
+            data: encode_close_account(user_idx),
+        };
+        let tx = Transaction::new_signed_with_payer(
+            &[ix], Some(&owner.pubkey()), &[owner], self.svm.latest_blockhash(),
+        );
+        self.svm.send_transaction(tx)
+            .map(|_| ())
+            .map_err(|e| format!("{:?}", e))
+    }
+
+    fn try_close_slab(&mut self) -> Result<(), String> {
+        let admin = Keypair::from_bytes(&self.payer.to_bytes()).unwrap();
+        let ix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(self.slab, false),
+            ],
+            data: encode_close_slab(),
+        };
+        let tx = Transaction::new_signed_with_payer(
+            &[ix], Some(&admin.pubkey()), &[&admin], self.svm.latest_blockhash(),
+        );
+        self.svm.send_transaction(tx)
+            .map(|_| ())
+            .map_err(|e| format!("{:?}", e))
+    }
+
+    fn try_set_oracle_price_cap(&mut self, signer: &Keypair, max_change_e2bps: u64) -> Result<(), String> {
+        let ix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(signer.pubkey(), true),
+                AccountMeta::new(self.slab, false),
+            ],
+            data: encode_set_oracle_price_cap(max_change_e2bps),
+        };
+        let tx = Transaction::new_signed_with_payer(
+            &[ix], Some(&signer.pubkey()), &[signer], self.svm.latest_blockhash(),
+        );
+        self.svm.send_transaction(tx)
+            .map(|_| ())
+            .map_err(|e| format!("{:?}", e))
+    }
 }
 
 // ============================================================================
@@ -10179,4 +10240,1020 @@ fn test_attack_full_lifecycle_conservation() {
     // Vault should still have all tokens (internal PnL transfer, no external movement)
     assert_eq!(env.vault_balance(), total,
         "ATTACK: Conservation through full trade lifecycle violated");
+}
+
+// ============================================================================
+// ROUND 5: Hyperp mode, premarket resolution, multi-LP, sandwich attacks
+// ============================================================================
+
+/// ATTACK: In Hyperp mode, TradeCpi updates mark price with execution price.
+/// An attacker could try rapid trades to push mark far from index to extract
+/// value via favorable PnL. Circuit breaker should limit mark movement.
+#[test]
+fn test_attack_hyperp_mark_manipulation_via_trade() {
+    let Some(mut env) = TradeCpiTestEnv::new() else { return; };
+
+    env.init_market_hyperp(1_000_000); // mark = 1.0
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    let matcher_prog = env.matcher_program_id;
+    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
+    env.try_push_oracle_price(&admin, 1_000_000, 1000).unwrap();
+
+    // Set price cap so circuit breaker is active
+    env.try_set_oracle_price_cap(&admin, 500).unwrap(); // 5% per slot
+
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
+    env.deposit(&lp, lp_idx, 100_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000);
+
+    env.set_slot(100);
+    env.crank();
+
+    // Vault before
+    let vault_before = env.read_vault();
+
+    // Execute trade - this updates mark via circuit breaker
+    let result = env.try_trade_cpi(
+        &user, &lp.pubkey(), lp_idx, user_idx, 500_000_000,
+        &matcher_prog, &matcher_ctx,
+    );
+    assert!(result.is_ok(), "First trade should succeed: {:?}", result);
+
+    // Execute reverse trade to close
+    let result = env.try_trade_cpi(
+        &user, &lp.pubkey(), lp_idx, user_idx, -500_000_000,
+        &matcher_prog, &matcher_ctx,
+    );
+    assert!(result.is_ok(), "Reverse trade should succeed: {:?}", result);
+
+    // Crank to settle
+    env.set_slot(200);
+    env.crank();
+
+    // Vault after - no value should be created or destroyed
+    let vault_after = env.read_vault();
+    assert_eq!(vault_before, vault_after,
+        "ATTACK: Mark manipulation via TradeCpi created value. before={}, after={}",
+        vault_before, vault_after);
+}
+
+/// ATTACK: In Hyperp mode, index lags behind mark due to rate limiting.
+/// Attacker could try to profit by trading when mark diverges from index,
+/// then cranking to move index toward mark. This test verifies conservation.
+#[test]
+fn test_attack_hyperp_index_lag_exploitation() {
+    let Some(mut env) = TradeCpiTestEnv::new() else { return; };
+
+    env.init_market_hyperp(1_000_000);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    let matcher_prog = env.matcher_program_id;
+    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
+    env.try_push_oracle_price(&admin, 1_000_000, 1000).unwrap();
+    env.try_set_oracle_price_cap(&admin, 10_000).unwrap(); // 100% per slot cap
+
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
+    env.deposit(&lp, lp_idx, 100_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000);
+
+    env.set_slot(100);
+    env.crank();
+
+    let vault_total = env.read_vault();
+
+    // Push mark price up significantly (circuit breaker will clamp)
+    env.try_push_oracle_price(&admin, 2_000_000, 2000).unwrap();
+
+    // Trade at slot 101 (index lags behind new mark)
+    env.set_slot(101);
+    let result = env.try_trade_cpi(
+        &user, &lp.pubkey(), lp_idx, user_idx, 100_000_000,
+        &matcher_prog, &matcher_ctx,
+    );
+    assert!(result.is_ok(), "Trade should succeed: {:?}", result);
+
+    // Crank to settle funding and move index toward mark
+    env.set_slot(200);
+    env.crank();
+
+    // Close position at new price
+    let result = env.try_trade_cpi(
+        &user, &lp.pubkey(), lp_idx, user_idx, -100_000_000,
+        &matcher_prog, &matcher_ctx,
+    );
+    assert!(result.is_ok(), "Close trade should succeed: {:?}", result);
+
+    env.set_slot(300);
+    env.crank();
+
+    // Conservation: total vault should remain the same (PnL is zero-sum internally)
+    let vault_after = env.read_vault();
+    assert_eq!(vault_total, vault_after,
+        "ATTACK: Index lag exploitation created value. before={}, after={}",
+        vault_total, vault_after);
+}
+
+/// ATTACK: Force-close during premarket resolution should maintain PnL conservation.
+/// Sum of all PnL changes after force-close should be zero (zero-sum).
+#[test]
+fn test_attack_premarket_force_close_pnl_conservation() {
+    let Some(mut env) = TradeCpiTestEnv::new() else { return; };
+
+    env.init_market_hyperp(1_000_000);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    let matcher_prog = env.matcher_program_id;
+    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
+    env.try_push_oracle_price(&admin, 1_000_000, 1000).unwrap();
+
+    // Create LP and 3 users with positions
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
+    env.deposit(&lp, lp_idx, 100_000_000_000);
+
+    let mut users = Vec::new();
+    for _ in 0..3 {
+        let user = Keypair::new();
+        let user_idx = env.init_user(&user);
+        env.deposit(&user, user_idx, 2_000_000_000);
+        users.push((user, user_idx));
+    }
+
+    env.set_slot(100);
+    env.crank();
+
+    // Each user takes a different sized position
+    for (i, (user, user_idx)) in users.iter().enumerate() {
+        let size = ((i as i128) + 1) * 50_000_000;
+        let result = env.try_trade_cpi(
+            user, &lp.pubkey(), lp_idx, *user_idx, size,
+            &matcher_prog, &matcher_ctx,
+        );
+        assert!(result.is_ok(), "Trade {} should succeed: {:?}", i, result);
+    }
+
+    env.set_slot(150);
+    env.crank();
+
+    // Record PnL before force-close
+    let lp_pnl_before = env.read_account_pnl(lp_idx);
+    let mut user_pnl_before_sum: i128 = 0;
+    for (_, user_idx) in &users {
+        user_pnl_before_sum += env.read_account_pnl(*user_idx);
+    }
+    let total_pnl_before = lp_pnl_before + user_pnl_before_sum;
+
+    // Resolve at different price to create PnL
+    env.try_push_oracle_price(&admin, 1_500_000, 2000).unwrap(); // 50% up
+    env.try_resolve_market(&admin).unwrap();
+
+    // Force-close via crank
+    env.set_slot(300);
+    env.crank();
+    env.set_slot(400);
+    env.crank(); // Second crank in case pagination needed
+
+    // All positions should be closed
+    for (_, user_idx) in &users {
+        assert_eq!(env.read_account_position(*user_idx), 0,
+            "User position should be zero after force-close");
+    }
+    assert_eq!(env.read_account_position(lp_idx), 0,
+        "LP position should be zero after force-close");
+
+    // PnL changes should sum to zero (zero-sum game)
+    let lp_pnl_after = env.read_account_pnl(lp_idx);
+    let mut user_pnl_after_sum: i128 = 0;
+    for (_, user_idx) in &users {
+        user_pnl_after_sum += env.read_account_pnl(*user_idx);
+    }
+    let total_pnl_after = lp_pnl_after + user_pnl_after_sum;
+
+    // The delta in total PnL should be zero (all PnL from force-close is zero-sum)
+    let pnl_delta = total_pnl_after - total_pnl_before;
+    assert_eq!(pnl_delta, 0,
+        "ATTACK: Force-close PnL not zero-sum! delta={}, LP pnl: {}→{}, users pnl: {}→{}",
+        pnl_delta, lp_pnl_before, lp_pnl_after, user_pnl_before_sum, user_pnl_after_sum);
+}
+
+/// ATTACK: Try to withdraw all capital before force-close in a resolved market.
+/// User might try to extract capital while still having an open position.
+#[test]
+fn test_attack_premarket_withdraw_before_force_close() {
+    let Some(mut env) = TradeCpiTestEnv::new() else { return; };
+
+    env.init_market_hyperp(1_000_000);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    let matcher_prog = env.matcher_program_id;
+    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
+    env.try_push_oracle_price(&admin, 1_000_000, 1000).unwrap();
+
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
+    env.deposit(&lp, lp_idx, 50_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 5_000_000_000);
+
+    env.set_slot(100);
+    env.crank();
+
+    // User takes large position
+    let result = env.try_trade_cpi(
+        &user, &lp.pubkey(), lp_idx, user_idx, 500_000_000,
+        &matcher_prog, &matcher_ctx,
+    );
+    assert!(result.is_ok(), "Trade should succeed");
+
+    // Resolve market
+    env.try_push_oracle_price(&admin, 1_000_000, 2000).unwrap();
+    env.try_resolve_market(&admin).unwrap();
+
+    // Try to withdraw all capital before force-close completes
+    // This should either fail (margin check) or be limited
+    let result = env.try_withdraw(&user, user_idx, 5_000_000_000);
+    // With open position, margin check should prevent full withdrawal
+    assert!(result.is_err(),
+        "ATTACK: Should not be able to withdraw all capital with open position in resolved market");
+}
+
+/// ATTACK: Extra cranks after all positions are force-closed should be idempotent.
+/// No state corruption from redundant resolution cranks.
+#[test]
+fn test_attack_premarket_extra_cranks_idempotent() {
+    let Some(mut env) = TradeCpiTestEnv::new() else { return; };
+
+    env.init_market_hyperp(1_000_000);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    let matcher_prog = env.matcher_program_id;
+    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
+    env.try_push_oracle_price(&admin, 1_000_000, 1000).unwrap();
+
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000_000);
+
+    env.set_slot(100);
+    env.crank();
+
+    let result = env.try_trade_cpi(
+        &user, &lp.pubkey(), lp_idx, user_idx, 100_000_000,
+        &matcher_prog, &matcher_ctx,
+    );
+    assert!(result.is_ok(), "Trade should succeed");
+
+    // Resolve and force-close
+    env.try_push_oracle_price(&admin, 1_500_000, 2000).unwrap();
+    env.try_resolve_market(&admin).unwrap();
+
+    env.set_slot(200);
+    env.crank();
+
+    // Verify positions are closed
+    assert_eq!(env.read_account_position(user_idx), 0);
+    assert_eq!(env.read_account_position(lp_idx), 0);
+
+    // Record state after first set of cranks
+    let pnl_user_1 = env.read_account_pnl(user_idx);
+    let pnl_lp_1 = env.read_account_pnl(lp_idx);
+    let vault_1 = env.read_vault();
+    let insurance_1 = env.read_insurance_balance();
+
+    // Extra cranks should not change anything
+    env.set_slot(300);
+    env.crank();
+    env.set_slot(400);
+    env.crank();
+    env.set_slot(500);
+    env.crank();
+
+    // State should be identical
+    assert_eq!(env.read_account_pnl(user_idx), pnl_user_1,
+        "ATTACK: Extra crank changed user PnL");
+    assert_eq!(env.read_account_pnl(lp_idx), pnl_lp_1,
+        "ATTACK: Extra crank changed LP PnL");
+    assert_eq!(env.read_vault(), vault_1,
+        "ATTACK: Extra crank changed vault");
+    assert_eq!(env.read_insurance_balance(), insurance_1,
+        "ATTACK: Extra crank changed insurance");
+}
+
+/// ATTACK: Resolve market at extreme price (near u64::MAX).
+/// Test that force-close handles extreme PnL without overflow.
+#[test]
+fn test_attack_premarket_resolve_extreme_high_price() {
+    let Some(mut env) = TradeCpiTestEnv::new() else { return; };
+
+    env.init_market_hyperp(1_000_000);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    let matcher_prog = env.matcher_program_id;
+    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
+    env.try_push_oracle_price(&admin, 1_000_000, 1000).unwrap();
+
+    // Remove price cap to allow extreme price (for resolution scenario)
+    env.try_set_oracle_price_cap(&admin, 1_000_000_000).unwrap(); // Very high cap
+
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
+    env.deposit(&lp, lp_idx, 100_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000_000);
+
+    env.set_slot(100);
+    env.crank();
+
+    // Small trade
+    let result = env.try_trade_cpi(
+        &user, &lp.pubkey(), lp_idx, user_idx, 10_000_000,
+        &matcher_prog, &matcher_ctx,
+    );
+    assert!(result.is_ok(), "Trade should succeed");
+
+    // Push extremely high price for resolution
+    // Circuit breaker will clamp, but push multiple times to ramp up
+    for i in 0..20 {
+        let price = 1_000_000u64.saturating_mul(2u64.pow(i));
+        let _ = env.try_push_oracle_price(&admin, price.min(u64::MAX / 2), (3000 + i as i64));
+        env.set_slot(200 + i as u64 * 100);
+        env.crank();
+    }
+
+    // Resolve at whatever price we reached
+    env.try_resolve_market(&admin).unwrap();
+
+    // Force-close: should handle extreme PnL without panicking
+    env.set_slot(5000);
+    env.crank();
+
+    // Verify positions are closed (no overflow crash)
+    assert_eq!(env.read_account_position(user_idx), 0,
+        "User position should be closed after extreme price resolution");
+    assert_eq!(env.read_account_position(lp_idx), 0,
+        "LP position should be closed after extreme price resolution");
+}
+
+/// ATTACK: Non-admin tries to withdraw insurance after resolution.
+/// Only admin should be able to withdraw insurance funds.
+#[test]
+fn test_attack_withdraw_insurance_non_admin() {
+    let Some(mut env) = TradeCpiTestEnv::new() else { return; };
+
+    env.init_market_hyperp(1_000_000);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
+    env.try_push_oracle_price(&admin, 1_000_000, 1000).unwrap();
+
+    // Create user, deposit and resolve
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000_000);
+
+    env.try_resolve_market(&admin).unwrap();
+    env.set_slot(100);
+    env.crank();
+
+    // Non-admin tries to withdraw insurance
+    let attacker = Keypair::new();
+    env.svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
+    let result = env.try_withdraw_insurance(&attacker);
+    assert!(result.is_err(),
+        "ATTACK: Non-admin was able to withdraw insurance funds!");
+}
+
+/// ATTACK: Try to withdraw insurance twice to drain vault.
+/// Second withdrawal should find zero insurance and be a no-op.
+#[test]
+fn test_attack_double_withdraw_insurance() {
+    let Some(mut env) = TradeCpiTestEnv::new() else { return; };
+
+    env.init_market_hyperp(1_000_000);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    let matcher_prog = env.matcher_program_id;
+    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
+    env.try_push_oracle_price(&admin, 1_000_000, 1000).unwrap();
+
+    // Create LP and user with trade to generate fees (insurance fund gets fees)
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000_000);
+
+    env.set_slot(100);
+    env.crank();
+
+    let _ = env.try_trade_cpi(
+        &user, &lp.pubkey(), lp_idx, user_idx, 100_000_000,
+        &matcher_prog, &matcher_ctx,
+    );
+
+    // Resolve and force-close
+    env.try_push_oracle_price(&admin, 1_000_000, 2000).unwrap();
+    env.try_resolve_market(&admin).unwrap();
+    env.set_slot(200);
+    env.crank();
+
+    let _vault_before_first_withdraw = env.read_vault();
+
+    // First withdrawal should succeed
+    let result = env.try_withdraw_insurance(&admin);
+    assert!(result.is_ok(), "First insurance withdrawal should succeed: {:?}", result);
+
+    let vault_after_first = env.read_vault();
+
+    // Second withdrawal: insurance is zero, should be no-op (Ok but no transfer)
+    let result = env.try_withdraw_insurance(&admin);
+    assert!(result.is_ok(), "Second insurance withdrawal should be ok (no-op)");
+
+    let vault_after_second = env.read_vault();
+    assert_eq!(vault_after_first, vault_after_second,
+        "ATTACK: Double insurance withdrawal drained extra funds! after_first={}, after_second={}",
+        vault_after_first, vault_after_second);
+}
+
+/// ATTACK: TradeCpi in a resolved market should fail.
+/// After resolution, no new trades should be possible.
+#[test]
+fn test_attack_tradecpi_after_resolution() {
+    let Some(mut env) = TradeCpiTestEnv::new() else { return; };
+
+    env.init_market_hyperp(1_000_000);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    let matcher_prog = env.matcher_program_id;
+    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
+    env.try_push_oracle_price(&admin, 1_000_000, 1000).unwrap();
+
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000_000);
+
+    env.set_slot(100);
+    env.crank();
+
+    // Resolve market
+    env.try_resolve_market(&admin).unwrap();
+
+    // Try TradeCpi after resolution - should fail
+    let result = env.try_trade_cpi(
+        &user, &lp.pubkey(), lp_idx, user_idx, 100_000_000,
+        &matcher_prog, &matcher_ctx,
+    );
+    assert!(result.is_err(),
+        "ATTACK: TradeCpi succeeded on resolved market!");
+}
+
+/// ATTACK: Try to deposit after market resolution.
+/// Deposits should be blocked on resolved markets.
+#[test]
+fn test_attack_hyperp_deposit_after_resolution() {
+    let Some(mut env) = TradeCpiTestEnv::new() else { return; };
+
+    env.init_market_hyperp(1_000_000);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
+    env.try_push_oracle_price(&admin, 1_000_000, 1000).unwrap();
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000_000);
+
+    // Resolve
+    env.try_resolve_market(&admin).unwrap();
+
+    // Try to deposit more after resolution
+    let ata = env.create_ata(&user.pubkey(), 1_000_000_000);
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(user.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new(ata, false),
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+        ],
+        data: encode_deposit(user_idx, 500_000_000),
+    };
+    let tx = Transaction::new_signed_with_payer(
+        &[ix], Some(&user.pubkey()), &[&user], env.svm.latest_blockhash(),
+    );
+    let result = env.svm.send_transaction(tx);
+    assert!(result.is_err(),
+        "ATTACK: Deposit succeeded on resolved Hyperp market!");
+}
+
+/// ATTACK: Multi-LP conservation. Trade against 2 different LPs and verify
+/// no value is created or destroyed. Total vault must remain constant.
+#[test]
+fn test_attack_multi_lp_conservation() {
+    let Some(mut env) = TradeCpiTestEnv::new() else { return; };
+
+    env.init_market_hyperp(1_000_000);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    let matcher_prog = env.matcher_program_id;
+    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
+    env.try_push_oracle_price(&admin, 1_000_000, 1000).unwrap();
+
+    // Create 2 LPs
+    let lp1 = Keypair::new();
+    let (lp1_idx, matcher_ctx1) = env.init_lp_with_matcher(&lp1, &matcher_prog);
+    env.deposit(&lp1, lp1_idx, 50_000_000_000);
+
+    let lp2 = Keypair::new();
+    let (lp2_idx, matcher_ctx2) = env.init_lp_with_matcher(&lp2, &matcher_prog);
+    env.deposit(&lp2, lp2_idx, 50_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000);
+
+    env.set_slot(100);
+    env.crank();
+
+    let vault_before = env.read_vault();
+
+    // Trade against LP1 (long)
+    let result = env.try_trade_cpi(
+        &user, &lp1.pubkey(), lp1_idx, user_idx, 200_000_000,
+        &matcher_prog, &matcher_ctx1,
+    );
+    assert!(result.is_ok(), "Trade vs LP1 should succeed: {:?}", result);
+
+    // Trade against LP2 (long again)
+    let result = env.try_trade_cpi(
+        &user, &lp2.pubkey(), lp2_idx, user_idx, 100_000_000,
+        &matcher_prog, &matcher_ctx2,
+    );
+    assert!(result.is_ok(), "Trade vs LP2 should succeed: {:?}", result);
+
+    // Price moves
+    env.try_push_oracle_price(&admin, 1_200_000, 2000).unwrap();
+    env.set_slot(200);
+    env.crank();
+
+    // Close positions
+    let result = env.try_trade_cpi(
+        &user, &lp1.pubkey(), lp1_idx, user_idx, -200_000_000,
+        &matcher_prog, &matcher_ctx1,
+    );
+    assert!(result.is_ok(), "Close vs LP1 should succeed: {:?}", result);
+
+    let result = env.try_trade_cpi(
+        &user, &lp2.pubkey(), lp2_idx, user_idx, -100_000_000,
+        &matcher_prog, &matcher_ctx2,
+    );
+    assert!(result.is_ok(), "Close vs LP2 should succeed: {:?}", result);
+
+    env.set_slot(300);
+    env.crank();
+
+    let vault_after = env.read_vault();
+    assert_eq!(vault_before, vault_after,
+        "ATTACK: Multi-LP trading violated conservation. before={}, after={}",
+        vault_before, vault_after);
+}
+
+/// ATTACK: Sandwich attack. Deposit large amount before a trade to change
+/// haircut ratio, then withdraw after. Should not extract value.
+/// Attacker can only withdraw at most what they deposited.
+#[test]
+fn test_attack_sandwich_deposit_withdraw() {
+    let Some(mut env) = TradeCpiTestEnv::new() else { return; };
+
+    env.init_market_hyperp(1_000_000);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    let matcher_prog = env.matcher_program_id;
+    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
+    env.try_push_oracle_price(&admin, 1_000_000, 1000).unwrap();
+
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
+    env.deposit(&lp, lp_idx, 50_000_000_000);
+
+    // Victim user
+    let victim = Keypair::new();
+    let victim_idx = env.init_user(&victim);
+    env.deposit(&victim, victim_idx, 5_000_000_000);
+
+    env.set_slot(100);
+    env.crank();
+
+    // Create attacker AFTER crank to avoid GC of zero-balance account
+    let attacker = Keypair::new();
+    let attacker_idx = env.init_user(&attacker);
+
+    // Record vault before attacker deposit
+    let vault_before_attack = env.read_vault();
+
+    // Step 1: Attacker deposits large amount (sandwich front-run)
+    env.deposit(&attacker, attacker_idx, 20_000_000_000);
+
+    // Step 2: Victim trades
+    let result = env.try_trade_cpi(
+        &victim, &lp.pubkey(), lp_idx, victim_idx, 200_000_000,
+        &matcher_prog, &matcher_ctx,
+    );
+    assert!(result.is_ok(), "Victim trade should succeed: {:?}", result);
+
+    env.set_slot(200);
+    env.crank();
+
+    // Step 3: Attacker tries to withdraw everything (sandwich back-run)
+    // Attacker has no position and no PnL, so withdrawal should work for their capital
+    let result = env.try_withdraw(&attacker, attacker_idx, 20_000_000_000);
+
+    // Whether withdrawal succeeds or fails, vault must not lose original funds
+    let vault_after = env.read_vault();
+    // Vault should still have at least the pre-attack amount
+    // (attacker can only take back their own deposit, not extract from others)
+    assert!(vault_after >= vault_before_attack,
+        "ATTACK: Sandwich attack extracted value from vault! before_attack={}, after={}",
+        vault_before_attack, vault_after);
+
+    // Verify the test actually executed an assertion (non-vacuous)
+    // The above assert always runs regardless of withdraw success/failure
+    let _ = result; // suppress warning
+}
+
+/// ATTACK: Push oracle price to zero in Hyperp mode.
+/// Zero price should be rejected since it would break all calculations.
+#[test]
+fn test_attack_hyperp_push_zero_mark_price() {
+    let Some(mut env) = TradeCpiTestEnv::new() else { return; };
+
+    env.init_market_hyperp(1_000_000);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
+    env.try_push_oracle_price(&admin, 1_000_000, 1000).unwrap();
+
+    // Try pushing zero price
+    let result = env.try_push_oracle_price(&admin, 0, 2000);
+    assert!(result.is_err(),
+        "ATTACK: Zero price accepted in Hyperp mode!");
+}
+
+/// ATTACK: In Hyperp mode, crank at same slot should not move index (Bug #9 fix).
+/// Verify that dt=0 returns index unchanged, preventing smoothing bypass.
+#[test]
+fn test_attack_hyperp_same_slot_crank_no_index_movement() {
+    let mut env = TestEnv::new();
+    env.init_market_hyperp(1_000_000);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
+    env.try_push_oracle_price(&admin, 1_000_000, 1000).unwrap();
+    env.try_set_oracle_price_cap(&admin, 100).unwrap(); // 1% per slot
+
+    // First crank at slot 100 - this sets engine.current_slot = 100
+    env.set_slot(100);
+    env.crank();
+
+    // Push mark price significantly higher (mark=2.0, index still ~1.0)
+    env.try_push_oracle_price(&admin, 2_000_000, 2000).unwrap();
+
+    // Read last_effective_price_e6 (index) from config before same-slot crank
+    // Config offset: header is 16 bytes, config starts after that
+    // last_effective_price_e6 offset within config (check source for exact layout)
+    // Read last_effective_price_e6 (the index) before same-slot crank
+    // It's the last u64 in the config section: slab bytes [384..392]
+    let slab_before = env.svm.get_account(&env.slab).unwrap().data;
+    const INDEX_OFF: usize = 384;
+    let index_before = u64::from_le_bytes(
+        slab_before[INDEX_OFF..INDEX_OFF + 8].try_into().unwrap()
+    );
+    assert!(index_before > 0, "Index should be non-zero before crank");
+
+    // Try crank at same slot 100 again
+    let result = env.try_crank();
+    let slab_after = env.svm.get_account(&env.slab).unwrap().data;
+    let index_after = u64::from_le_bytes(
+        slab_after[INDEX_OFF..INDEX_OFF + 8].try_into().unwrap()
+    );
+
+    // Bug #9 fix: index must NOT move when dt=0 (same slot)
+    // Crank may update other fields (e.g. funding rate), but index stays put
+    assert_eq!(index_before, index_after,
+        "ATTACK: Same-slot crank moved index! Bug #9 regression. \
+         before={}, after={}, crank_result={:?}",
+        index_before, index_after, result);
+}
+
+/// ATTACK: Non-admin tries to resolve market.
+/// Only the admin should be able to resolve.
+#[test]
+fn test_attack_resolve_market_non_admin() {
+    let mut env = TestEnv::new();
+    env.init_market_hyperp(1_000_000);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
+    env.try_push_oracle_price(&admin, 1_000_000, 1000).unwrap();
+
+    // Non-admin tries to resolve
+    let attacker = Keypair::new();
+    env.svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
+    let result = env.try_resolve_market(&attacker);
+    assert!(result.is_err(),
+        "ATTACK: Non-admin was able to resolve market!");
+    assert!(!env.is_market_resolved(),
+        "Market should NOT be resolved after failed attempt");
+}
+
+/// ATTACK: LP tries to close account while it still has a position from force-close PnL.
+/// After force-close, LP may have PnL that prevents account closure.
+#[test]
+fn test_attack_lp_close_account_with_pnl_after_force_close() {
+    let Some(mut env) = TradeCpiTestEnv::new() else { return; };
+
+    env.init_market_hyperp(1_000_000);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    let matcher_prog = env.matcher_program_id;
+    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
+    env.try_push_oracle_price(&admin, 1_000_000, 1000).unwrap();
+
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000_000);
+
+    env.set_slot(100);
+    env.crank();
+
+    // Trade to create positions
+    let result = env.try_trade_cpi(
+        &user, &lp.pubkey(), lp_idx, user_idx, 100_000_000,
+        &matcher_prog, &matcher_ctx,
+    );
+    assert!(result.is_ok(), "Trade should succeed");
+
+    // Resolve at different price (creates PnL)
+    env.try_push_oracle_price(&admin, 1_500_000, 2000).unwrap();
+    env.try_resolve_market(&admin).unwrap();
+
+    env.set_slot(200);
+    env.crank();
+
+    // Positions should be zero
+    assert_eq!(env.read_account_position(lp_idx), 0);
+
+    // LP should have non-zero PnL from force-close at different price (1.5 vs 1.0)
+    // LP took the short side, price went up → LP has negative PnL
+    let lp_pnl = env.read_account_pnl(lp_idx);
+    assert!(lp_pnl != 0,
+        "LP PnL should be non-zero after force-close at 50% different price");
+
+    // LP with non-zero PnL should NOT be able to close account
+    // (CloseAccount requires PnL=0)
+    let close_result = env.try_close_account(&lp, lp_idx);
+    assert!(close_result.is_err(),
+        "ATTACK: LP closed account with PnL={} after force-close!", lp_pnl);
+}
+
+/// ATTACK: Try to init new LP after Hyperp market resolution.
+/// Resolved Hyperp markets should block InitLP.
+#[test]
+fn test_attack_hyperp_init_lp_after_resolution() {
+    let mut env = TestEnv::new();
+    env.init_market_hyperp(1_000_000);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
+    env.try_push_oracle_price(&admin, 1_000_000, 1000).unwrap();
+
+    // Resolve market
+    env.try_resolve_market(&admin).unwrap();
+
+    // Try to init new LP
+    let new_lp = Keypair::new();
+    let result = env.try_init_lp(&new_lp);
+    assert!(result.is_err(),
+        "ATTACK: InitLP succeeded on resolved market!");
+}
+
+/// ATTACK: Push oracle price with extreme u64 value.
+/// Circuit breaker should clamp price movement.
+#[test]
+fn test_attack_hyperp_push_extreme_price() {
+    let mut env = TestEnv::new();
+    env.init_market_hyperp(1_000_000);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
+    env.try_push_oracle_price(&admin, 1_000_000, 1000).unwrap();
+    env.try_set_oracle_price_cap(&admin, 500).unwrap(); // 5% per slot
+
+    // Push extreme price - should be clamped by circuit breaker
+    let result = env.try_push_oracle_price(&admin, u64::MAX / 2, 2000);
+    assert!(result.is_ok(), "Extreme push should succeed (circuit breaker clamps)");
+
+    // Read stored last_effective_price_e6 - must be clamped, not u64::MAX/2
+    // last_effective_price_e6 is at slab offset 384 (last u64 in config before engine)
+    let slab_data = env.svm.get_account(&env.slab).unwrap().data;
+    const INDEX_OFF: usize = 384;
+    let stored_price = u64::from_le_bytes(
+        slab_data[INDEX_OFF..INDEX_OFF + 8].try_into().unwrap()
+    );
+    // With 5% cap and base price 1_000_000, max clamped = 1_050_000
+    assert!(stored_price < 2_000_000,
+        "ATTACK: Circuit breaker failed to clamp extreme price! stored={}, pushed={}",
+        stored_price, u64::MAX / 2);
+    assert!(stored_price > 0,
+        "Stored price should be positive after push");
+}
+
+/// ATTACK: Hyperp funding rate extraction. Create position, crank many times
+/// to accumulate premium funding, then check that funding doesn't create value.
+#[test]
+fn test_attack_hyperp_funding_rate_no_value_creation() {
+    let Some(mut env) = TradeCpiTestEnv::new() else { return; };
+
+    env.init_market_hyperp(1_000_000);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    let matcher_prog = env.matcher_program_id;
+    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
+    env.try_push_oracle_price(&admin, 1_000_000, 1000).unwrap();
+
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
+    env.deposit(&lp, lp_idx, 50_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 5_000_000_000);
+
+    env.set_slot(100);
+    env.crank();
+
+    let vault_before = env.read_vault();
+
+    // Open position
+    let result = env.try_trade_cpi(
+        &user, &lp.pubkey(), lp_idx, user_idx, 200_000_000,
+        &matcher_prog, &matcher_ctx,
+    );
+    assert!(result.is_ok(), "Trade should succeed");
+
+    // Push mark price higher to create premium (mark > index → positive funding)
+    env.try_push_oracle_price(&admin, 1_100_000, 2000).unwrap();
+
+    // Crank many times to accumulate funding payments
+    for i in 0..10 {
+        env.set_slot(200 + i * 100);
+        env.crank();
+    }
+
+    // Close position
+    let result = env.try_trade_cpi(
+        &user, &lp.pubkey(), lp_idx, user_idx, -200_000_000,
+        &matcher_prog, &matcher_ctx,
+    );
+    assert!(result.is_ok(), "Close trade should succeed: {:?}", result);
+
+    env.set_slot(1500);
+    env.crank();
+
+    // Vault conservation: funding payments are internal transfers, no value created
+    let vault_after = env.read_vault();
+    assert_eq!(vault_before, vault_after,
+        "ATTACK: Funding rate created value. before={}, after={}",
+        vault_before, vault_after);
+}
+
+/// ATTACK: Change oracle authority during active Hyperp positions.
+/// Old authority must be rejected, new authority must be accepted.
+#[test]
+fn test_attack_hyperp_oracle_authority_swap_with_positions() {
+    let Some(mut env) = TradeCpiTestEnv::new() else { return; };
+
+    env.init_market_hyperp(1_000_000);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    let matcher_prog = env.matcher_program_id;
+    let old_authority = Keypair::new();
+    env.svm.airdrop(&old_authority.pubkey(), 1_000_000_000).unwrap();
+    env.try_set_oracle_authority(&admin, &old_authority.pubkey()).unwrap();
+    env.try_push_oracle_price(&old_authority, 1_000_000, 1000).unwrap();
+
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000_000);
+
+    env.set_slot(100);
+    env.crank();
+
+    // Open position under old authority
+    let result = env.try_trade_cpi(
+        &user, &lp.pubkey(), lp_idx, user_idx, 100_000_000,
+        &matcher_prog, &matcher_ctx,
+    );
+    assert!(result.is_ok(), "Trade should succeed");
+
+    // Change oracle authority
+    let new_authority = Keypair::new();
+    env.svm.airdrop(&new_authority.pubkey(), 1_000_000_000).unwrap();
+    env.try_set_oracle_authority(&admin, &new_authority.pubkey()).unwrap();
+
+    // Old authority should no longer be able to push prices
+    let result = env.try_push_oracle_price(&old_authority, 2_000_000, 2000);
+    assert!(result.is_err(),
+        "ATTACK: Old oracle authority still accepted after change!");
+
+    // New authority should work
+    let result = env.try_push_oracle_price(&new_authority, 1_000_000, 2000);
+    assert!(result.is_ok(), "New authority should be able to push prices: {:?}", result);
+
+    // Verify core security property: 3 assertions tested above
+    // 1. Trade succeeded under old authority
+    // 2. Old authority rejected after change
+    // 3. New authority accepted
+}
+
+/// ATTACK: Close slab without withdrawing insurance first.
+/// CloseSlab requires insurance_fund.balance == 0.
+#[test]
+fn test_attack_close_slab_before_insurance_withdrawal() {
+    let Some(mut env) = TradeCpiTestEnv::new() else { return; };
+
+    env.init_market_hyperp(1_000_000);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    let matcher_prog = env.matcher_program_id;
+    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
+    env.try_push_oracle_price(&admin, 1_000_000, 1000).unwrap();
+
+    // Create LP and user, trade to generate fees
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000_000);
+
+    env.set_slot(100);
+    env.crank();
+
+    let _ = env.try_trade_cpi(
+        &user, &lp.pubkey(), lp_idx, user_idx, 100_000_000,
+        &matcher_prog, &matcher_ctx,
+    );
+
+    // Resolve and force-close
+    env.try_push_oracle_price(&admin, 1_000_000, 2000).unwrap();
+    env.try_resolve_market(&admin).unwrap();
+    env.set_slot(200);
+    env.crank();
+
+    // CloseSlab should fail even after force-close: vault still has tokens,
+    // accounts still exist (num_used > 0), and possibly insurance > 0
+    let result = env.try_close_slab();
+    assert!(result.is_err(),
+        "ATTACK: CloseSlab succeeded with active accounts and/or insurance remaining!");
+
+    // Verify at least one blocking condition holds
+    let insurance = env.read_insurance_balance();
+    let num_used = env.read_num_used_accounts();
+    assert!(insurance > 0 || num_used > 0,
+        "Test setup: expected either insurance or used accounts to block CloseSlab");
 }
