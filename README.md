@@ -1,6 +1,10 @@
 # Percolator (Solana Program)
 
-Percolator is a minimal Solana program that wraps the `percolator` crate’s `RiskEngine` inside a single on-chain **slab** account and exposes a small, composable instruction set for deploying and operating perpetual markets.
+> **⚠️ DISCLAIMER: FOR EDUCATIONAL PURPOSES ONLY**
+>
+> This code has **NOT been audited**. Do NOT use in production or with real funds. This is experimental software provided for learning and testing purposes only. Use at your own risk.
+
+Percolator is a minimal Solana program that wraps the `percolator` crate's `RiskEngine` inside a single on-chain **slab** account and exposes a small, composable instruction set for deploying and operating perpetual markets.
 
 This README is intentionally **high-level**: it explains the trust model, account layout, operational flows, and the parts that are easy to get wrong (CPI binding, nonce discipline, oracle usage, and gating). It does **not** restate code structure or obvious Rust/Solana boilerplate.
 
