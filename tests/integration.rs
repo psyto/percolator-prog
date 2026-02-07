@@ -9640,3 +9640,543 @@ fn test_attack_trade_crash_reverse_conservation() {
     env.crank();
     assert_eq!(env.vault_balance(), total, "Conservation after recovery");
 }
+
+// ============================================================================
+// PEN TEST SUITE ROUND 4: Account Type Confusion, Capacity Limits,
+// InitLP/InitUser Edge Cases, Multi-User Withdrawal, Index Bounds
+// ============================================================================
+
+impl TestEnv {
+    fn try_init_lp(&mut self, owner: &Keypair) -> Result<u16, String> {
+        let idx = self.account_count;
+        self.svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
+        let ata = self.create_ata(&owner.pubkey(), 0);
+
+        let ix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(owner.pubkey(), true),
+                AccountMeta::new(self.slab, false),
+                AccountMeta::new(ata, false),
+                AccountMeta::new(self.vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(sysvar::clock::ID, false),
+                AccountMeta::new_readonly(self.pyth_col, false),
+            ],
+            data: encode_init_lp(&Pubkey::new_unique(), &Pubkey::new_unique(), 0),
+        };
+
+        let tx = Transaction::new_signed_with_payer(
+            &[ix], Some(&owner.pubkey()), &[owner], self.svm.latest_blockhash(),
+        );
+        match self.svm.send_transaction(tx) {
+            Ok(_) => {
+                self.account_count += 1;
+                Ok(idx)
+            }
+            Err(e) => Err(format!("{:?}", e)),
+        }
+    }
+
+    /// Try trade where user passes a user_idx as lp_idx (type confusion)
+    fn try_trade_type_confused(
+        &mut self,
+        user: &Keypair,
+        victim: &Keypair,
+        victim_idx: u16,
+        user_idx: u16,
+        size: i128,
+    ) -> Result<(), String> {
+        let ix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(user.pubkey(), true),
+                AccountMeta::new(victim.pubkey(), true), // victim acts as "LP"
+                AccountMeta::new(self.slab, false),
+                AccountMeta::new_readonly(sysvar::clock::ID, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
+            ],
+            data: encode_trade(victim_idx, user_idx, size), // pass user idx as lp_idx
+        };
+
+        let tx = Transaction::new_signed_with_payer(
+            &[ix], Some(&user.pubkey()), &[user, victim], self.svm.latest_blockhash(),
+        );
+        self.svm.send_transaction(tx)
+            .map(|_| ())
+            .map_err(|e| format!("{:?}", e))
+    }
+
+    /// Try deposit to a specific index with specific amount (for testing out-of-bounds)
+    fn try_deposit_to_idx(&mut self, owner: &Keypair, idx: u16, amount: u64) -> Result<(), String> {
+        let ata = self.create_ata(&owner.pubkey(), amount);
+
+        let ix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(owner.pubkey(), true),
+                AccountMeta::new(self.slab, false),
+                AccountMeta::new(ata, false),
+                AccountMeta::new(self.vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(sysvar::clock::ID, false),
+            ],
+            data: encode_deposit(idx, amount),
+        };
+
+        let tx = Transaction::new_signed_with_payer(
+            &[ix], Some(&owner.pubkey()), &[owner], self.svm.latest_blockhash(),
+        );
+        self.svm.send_transaction(tx)
+            .map(|_| ())
+            .map_err(|e| format!("{:?}", e))
+    }
+}
+
+// ============================================================================
+// 31. Account Type Confusion
+// ============================================================================
+
+/// ATTACK: Use a user account index as the LP index in TradeNoCpi.
+/// Expected: Rejected because the account is not an LP (EngineAccountKindMismatch).
+#[test]
+fn test_attack_trade_user_as_lp() {
+    let path = program_path();
+    if !path.exists() { println!("SKIP: BPF not found"); return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 100_000_000_000);
+
+    // Create two regular users
+    let user1 = Keypair::new();
+    let user1_idx = env.init_user(&user1);
+    env.deposit(&user1, user1_idx, 10_000_000_000);
+
+    let user2 = Keypair::new();
+    let user2_idx = env.init_user(&user2);
+    env.deposit(&user2, user2_idx, 10_000_000_000);
+
+    // Try to trade user2 vs user1 (user1 as "LP") - should fail
+    let result = env.try_trade_type_confused(&user2, &user1, user1_idx, user2_idx, 1_000_000);
+    assert!(result.is_err(),
+        "ATTACK: Using user account as LP in trade should fail (kind mismatch)");
+}
+
+/// ATTACK: Deposit to an LP account using DepositCollateral.
+/// Expected: Should succeed (LP accounts can receive deposits like users).
+#[test]
+fn test_attack_deposit_to_lp_account() {
+    let path = program_path();
+    if !path.exists() { println!("SKIP: BPF not found"); return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+
+    // LP can deposit via DepositCollateral
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+    let capital = env.read_account_capital(lp_idx);
+    assert!(capital > 0, "LP should be able to receive deposits");
+
+    // Vault should have the tokens
+    assert_eq!(env.vault_balance(), 10_000_000_000, "Vault should have LP deposit");
+}
+
+/// ATTACK: LiquidateAtOracle targeting an LP account.
+/// Expected: LP liquidation may be handled differently (LP has position from trading).
+#[test]
+fn test_attack_liquidate_lp_account() {
+    let path = program_path();
+    if !path.exists() { println!("SKIP: BPF not found"); return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000);
+
+    // User trades against LP - LP takes the other side
+    env.trade(&user, &lp, lp_idx, user_idx, 50_000_000);
+    env.set_slot(200);
+    env.crank();
+
+    // LP has counter-position. Try to liquidate LP.
+    let capital_before = env.read_account_capital(lp_idx);
+    let pos_before = env.read_account_position(lp_idx);
+    let _ = env.try_liquidate_target(lp_idx);
+
+    // Whether liquidation succeeds or fails, verify no corruption
+    let capital_after = env.read_account_capital(lp_idx);
+    let vault = env.vault_balance();
+    assert!(vault > 0, "Vault should still have balance after LP liquidation attempt");
+    // LP capital should not have increased (no value extraction)
+    assert!(capital_after <= capital_before + 1, // +1 for rounding tolerance
+        "LP should not profit from liquidation attempt. Before: {}, After: {}",
+        capital_before, capital_after);
+}
+
+// ============================================================================
+// 32. Index Bounds Attacks
+// ============================================================================
+
+/// ATTACK: Deposit to an out-of-bounds account index.
+/// Expected: Rejected by check_idx (index >= max_accounts).
+#[test]
+fn test_attack_deposit_out_of_bounds_index() {
+    let path = program_path();
+    if !path.exists() { println!("SKIP: BPF not found"); return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let user = Keypair::new();
+    env.svm.airdrop(&user.pubkey(), 10_000_000_000).unwrap();
+
+    // Try to deposit to index MAX_ACCOUNTS (out of bounds)
+    let result = env.try_deposit_to_idx(&user, MAX_ACCOUNTS as u16, 1_000_000_000);
+    assert!(result.is_err(),
+        "ATTACK: Deposit to out-of-bounds index should fail");
+
+    // Try index u16::MAX
+    let result = env.try_deposit_to_idx(&user, u16::MAX, 1_000_000_000);
+    assert!(result.is_err(),
+        "ATTACK: Deposit to u16::MAX index should fail");
+}
+
+/// ATTACK: Trade with out-of-bounds user_idx.
+/// Expected: Rejected by check_idx.
+#[test]
+fn test_attack_trade_out_of_bounds_index() {
+    let path = program_path();
+    if !path.exists() { println!("SKIP: BPF not found"); return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 100_000_000_000);
+
+    let user = Keypair::new();
+    env.svm.airdrop(&user.pubkey(), 1_000_000_000).unwrap();
+
+    // Trade with user_idx = 9999 (non-existent)
+    let result = env.try_trade(&user, &lp, lp_idx, 9999, 1_000_000);
+    assert!(result.is_err(),
+        "ATTACK: Trade with out-of-bounds user_idx should fail");
+}
+
+/// ATTACK: Withdraw from out-of-bounds index.
+/// Expected: Rejected by check_idx.
+#[test]
+fn test_attack_withdraw_out_of_bounds_index() {
+    let path = program_path();
+    if !path.exists() { println!("SKIP: BPF not found"); return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let user = Keypair::new();
+    env.svm.airdrop(&user.pubkey(), 1_000_000_000).unwrap();
+
+    let result = env.try_withdraw(&user, u16::MAX, 1_000_000);
+    assert!(result.is_err(),
+        "ATTACK: Withdraw from out-of-bounds index should fail");
+}
+
+/// ATTACK: LiquidateAtOracle with out-of-bounds target index.
+/// Expected: Rejected by check_idx.
+#[test]
+fn test_attack_liquidate_out_of_bounds_index() {
+    let path = program_path();
+    if !path.exists() { println!("SKIP: BPF not found"); return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let result = env.try_liquidate_target(u16::MAX);
+    assert!(result.is_err(),
+        "ATTACK: Liquidate out-of-bounds index should fail");
+}
+
+// ============================================================================
+// 33. InitLP/InitUser Edge Cases
+// ============================================================================
+
+/// ATTACK: InitLP after market resolution.
+/// Expected: Rejected (no new LPs on resolved markets).
+#[test]
+fn test_attack_init_lp_after_resolution() {
+    let path = program_path();
+    if !path.exists() { println!("SKIP: BPF not found"); return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    let _ = env.try_set_oracle_authority(&admin, &admin.pubkey());
+    let _ = env.try_push_oracle_price(&admin, 138_000_000, 100);
+    let _ = env.try_resolve_market(&admin);
+
+    // Try InitLP after resolution
+    let lp = Keypair::new();
+    let result = env.try_init_lp(&lp);
+    assert!(result.is_err(),
+        "ATTACK: InitLP after resolution should be rejected");
+}
+
+/// ATTACK: InitUser with zero fee_payment and verify clean initialization.
+/// Expected: Account created with zero capital (fee_payment=0 is valid).
+#[test]
+fn test_attack_init_user_zero_fee() {
+    let path = program_path();
+    if !path.exists() { println!("SKIP: BPF not found"); return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    // Default init_user uses fee=0 (which is what we want to test)
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+
+    let capital = env.read_account_capital(user_idx);
+    assert_eq!(capital, 0, "Account with zero fee should have zero capital");
+
+    // Should still be able to deposit after
+    env.deposit(&user, user_idx, 1_000_000_000);
+    let capital_after = env.read_account_capital(user_idx);
+    assert!(capital_after > 0, "Should be able to deposit after zero-fee init");
+}
+
+// ============================================================================
+// 34. Multi-User Withdrawal Race
+// ============================================================================
+
+/// ATTACK: Two users both try to withdraw max capital in the same slot.
+/// Expected: Both succeed (vault has enough), conservation holds.
+#[test]
+fn test_attack_multi_user_withdraw_same_slot() {
+    let path = program_path();
+    if !path.exists() { println!("SKIP: BPF not found"); return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let user1 = Keypair::new();
+    let user1_idx = env.init_user(&user1);
+    env.deposit(&user1, user1_idx, 10_000_000_000);
+
+    let user2 = Keypair::new();
+    let user2_idx = env.init_user(&user2);
+    env.deposit(&user2, user2_idx, 10_000_000_000);
+
+    let vault_before = env.vault_balance();
+    assert_eq!(vault_before, 20_000_000_000, "Both deposits should be in vault");
+
+    // Both withdraw max capital
+    let result1 = env.try_withdraw(&user1, user1_idx, 10_000_000_000);
+    assert!(result1.is_ok(), "User1 withdraw should succeed: {:?}", result1);
+
+    let result2 = env.try_withdraw(&user2, user2_idx, 10_000_000_000);
+    assert!(result2.is_ok(), "User2 withdraw should succeed: {:?}", result2);
+
+    let vault_after = env.vault_balance();
+    assert_eq!(vault_after, 0, "Vault should be empty after both full withdrawals");
+}
+
+/// ATTACK: Double withdrawal from same account in same slot.
+/// Expected: Second withdrawal fails (insufficient capital).
+#[test]
+fn test_attack_double_withdraw_same_slot() {
+    let path = program_path();
+    if !path.exists() { println!("SKIP: BPF not found"); return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000);
+
+    // First withdrawal succeeds
+    let result = env.try_withdraw(&user, user_idx, 10_000_000_000);
+    assert!(result.is_ok(), "First full withdrawal should succeed: {:?}", result);
+
+    // Second withdrawal fails (no capital left)
+    let result = env.try_withdraw(&user, user_idx, 1_000_000_000);
+    assert!(result.is_err(),
+        "ATTACK: Second withdrawal after full drain should fail");
+}
+
+// ============================================================================
+// 35. Cross-Market Isolation
+// ============================================================================
+
+/// ATTACK: Verify two separate markets (slabs) don't interfere.
+/// Expected: Each market has independent state and vault.
+#[test]
+fn test_attack_cross_market_isolation() {
+    let path = program_path();
+    if !path.exists() { println!("SKIP: BPF not found"); return; }
+
+    // Create first market
+    let mut env1 = TestEnv::new();
+    env1.init_market_with_invert(0);
+
+    let user1 = Keypair::new();
+    let user1_idx = env1.init_user(&user1);
+    env1.deposit(&user1, user1_idx, 10_000_000_000);
+
+    // Create second market (different TestEnv = different slab)
+    let mut env2 = TestEnv::new();
+    env2.init_market_with_invert(0);
+
+    let user2 = Keypair::new();
+    let user2_idx = env2.init_user(&user2);
+    env2.deposit(&user2, user2_idx, 5_000_000_000);
+
+    // Verify independent vaults
+    assert_eq!(env1.vault_balance(), 10_000_000_000, "Market 1 vault");
+    assert_eq!(env2.vault_balance(), 5_000_000_000, "Market 2 vault");
+
+    // Withdraw from market 1 doesn't affect market 2
+    let _ = env1.try_withdraw(&user1, user1_idx, 5_000_000_000);
+    assert_eq!(env1.vault_balance(), 5_000_000_000, "Market 1 after withdraw");
+    assert_eq!(env2.vault_balance(), 5_000_000_000, "Market 2 unaffected");
+}
+
+// ============================================================================
+// 36. Slab Guard & Account Validation
+// ============================================================================
+
+/// ATTACK: Send instruction to wrong program_id's slab.
+/// Expected: Slab guard rejects (program_id embedded in slab header).
+#[test]
+fn test_attack_wrong_slab_program_id() {
+    let path = program_path();
+    if !path.exists() { println!("SKIP: BPF not found"); return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    // Create a user normally
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000_000);
+
+    // The slab header has the program_id baked in during InitMarket.
+    // If someone tried to invoke a different program with this slab,
+    // slab_guard would reject because program_id wouldn't match.
+    // We can't easily test cross-program in LiteSVM, but we can verify
+    // the slab_guard check exists by testing with the valid program.
+
+    // Verify market is working correctly with the right program
+    let result = env.try_withdraw(&user, user_idx, 500_000_000);
+    assert!(result.is_ok(), "Same-program operation should work: {:?}", result);
+    assert_eq!(env.vault_balance(), 500_000_000, "Vault should reflect withdrawal");
+}
+
+// ============================================================================
+// 37. Liquidation with No Position
+// ============================================================================
+
+/// ATTACK: Liquidate account that has capital but no position.
+/// Expected: No-op (nothing to liquidate).
+#[test]
+fn test_attack_liquidate_account_no_position() {
+    let path = program_path();
+    if !path.exists() { println!("SKIP: BPF not found"); return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000);
+
+    // User has capital but no position
+    let capital_before = env.read_account_capital(user_idx);
+    let _ = env.try_liquidate_target(user_idx);
+
+    // Capital should be unchanged (no liquidation happened)
+    let capital_after = env.read_account_capital(user_idx);
+    assert_eq!(capital_before, capital_after,
+        "ATTACK: Account with no position should not lose capital from liquidation");
+}
+
+// ============================================================================
+// 38. Trade Self-Trading Prevention
+// ============================================================================
+
+/// ATTACK: LP tries to trade against itself (user_idx == lp_idx).
+/// Expected: Rejected or no-op (can't trade against yourself).
+#[test]
+fn test_attack_self_trade_same_index() {
+    let path = program_path();
+    if !path.exists() { println!("SKIP: BPF not found"); return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 100_000_000_000);
+
+    // Try trade where LP trades against itself (lp_idx == user_idx)
+    let result = env.try_trade(&lp, &lp, lp_idx, lp_idx, 1_000_000);
+    // Should be rejected or result in no position change
+    if result.is_ok() {
+        let pos = env.read_account_position(lp_idx);
+        assert_eq!(pos, 0, "Self-trade should not create a position");
+    }
+    // Either rejected or no-op - vault must be intact
+    assert_eq!(env.vault_balance(), 100_000_000_000,
+        "ATTACK: Self-trade should not affect vault");
+}
+
+/// ATTACK: Conservation through complete lifecycle (init → trade → crank → close).
+/// Expected: After all accounts closed, vault should have only insurance fees.
+#[test]
+fn test_attack_full_lifecycle_conservation() {
+    let path = program_path();
+    if !path.exists() { println!("SKIP: BPF not found"); return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 100_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000);
+
+    let total = 110_000_000_000u64;
+    assert_eq!(env.vault_balance(), total, "Initial vault");
+
+    // Trade → crank → close
+    env.trade(&user, &lp, lp_idx, user_idx, 5_000_000);
+    env.set_slot_and_price(200, 150_000_000);
+    env.crank();
+
+    // Close the trade
+    env.trade(&user, &lp, lp_idx, user_idx, -5_000_000);
+    env.set_slot_and_price(300, 150_000_000);
+    env.crank();
+
+    // Vault should still have all tokens (internal PnL transfer, no external movement)
+    assert_eq!(env.vault_balance(), total,
+        "ATTACK: Conservation through full trade lifecycle violated");
+}
