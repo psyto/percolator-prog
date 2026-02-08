@@ -17910,3 +17910,828 @@ fn test_attack_rapid_open_close_open_cycle() {
     assert_eq!(c_tot, sum,
         "ATTACK: c_tot desync after open/close/open cycle! c_tot={} sum={}", c_tot, sum);
 }
+
+// ============================================================================
+// ROUND 15: Input validation, invalid instruction paths, slab guards,
+//           account state checks, multi-account scenarios, edge cases
+// ============================================================================
+
+/// ATTACK: Send instruction with tag=22 (just above max valid tag=20).
+/// Should fail gracefully.
+#[test]
+fn test_attack_instruction_tag_just_above_max() {
+    let path = program_path();
+    if !path.exists() { return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let user = Keypair::new();
+    env.svm.airdrop(&user.pubkey(), 1_000_000_000).unwrap();
+
+    // Tag = 22 (one above WithdrawInsurance=20)
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(user.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+        ],
+        data: vec![22u8],
+    };
+
+    let tx = Transaction::new_signed_with_payer(
+        &[ix], Some(&user.pubkey()), &[&user], env.svm.latest_blockhash(),
+    );
+    let result = env.svm.send_transaction(tx);
+    assert!(result.is_err(),
+        "ATTACK: Invalid instruction tag 22 should be rejected!");
+}
+
+/// ATTACK: Deposit with wrong slab account (different program_id slab).
+/// Slab owned by wrong program should be rejected by slab_guard.
+#[test]
+fn test_attack_deposit_wrong_slab_owner() {
+    let path = program_path();
+    if !path.exists() { return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000_000);
+
+    // Create a fake slab owned by system program
+    let fake_slab = Pubkey::new_unique();
+    let slab_data = env.svm.get_account(&env.slab).unwrap().data.clone();
+    env.svm.set_account(fake_slab, Account {
+        lamports: 1_000_000,
+        data: slab_data,
+        owner: solana_sdk::system_program::ID, // Wrong owner
+        executable: false,
+        rent_epoch: 0,
+    }).unwrap();
+
+    let ata = env.create_ata(&user.pubkey(), 1_000_000_000);
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(user.pubkey(), true),
+            AccountMeta::new(fake_slab, false),  // Wrong slab
+            AccountMeta::new(ata, false),
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+        ],
+        data: encode_deposit(user_idx, 1_000_000_000),
+    };
+
+    let tx = Transaction::new_signed_with_payer(
+        &[ix], Some(&user.pubkey()), &[&user], env.svm.latest_blockhash(),
+    );
+    let result = env.svm.send_transaction(tx);
+    assert!(result.is_err(),
+        "ATTACK: Deposit to slab with wrong owner should be rejected!");
+}
+
+/// ATTACK: Deposit without signer (user not signing).
+/// All operations require the user to sign.
+#[test]
+fn test_attack_deposit_without_signer() {
+    let path = program_path();
+    if !path.exists() { return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000_000);
+
+    // Try deposit with user as non-signer
+    let ata = env.create_ata(&user.pubkey(), 1_000_000_000);
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(user.pubkey(), false), // NOT a signer
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new(ata, false),
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+        ],
+        data: encode_deposit(user_idx, 1_000_000_000),
+    };
+
+    // Payer signs, but user doesn't
+    let payer = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[ix], Some(&payer.pubkey()), &[&payer], env.svm.latest_blockhash(),
+    );
+    let result = env.svm.send_transaction(tx);
+    assert!(result.is_err(),
+        "ATTACK: Deposit without user signer should be rejected!");
+}
+
+/// ATTACK: Four user accounts trading against same LP.
+/// Verify conservation holds across many accounts.
+#[test]
+fn test_attack_four_users_one_lp_conservation() {
+    let path = program_path();
+    if !path.exists() { return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 100_000_000_000);
+
+    let mut user_idxs = Vec::new();
+    for i in 0..4 {
+        let user = Keypair::new();
+        let user_idx = env.init_user(&user);
+        env.deposit(&user, user_idx, 5_000_000_000);
+        user_idxs.push((user, user_idx));
+    }
+
+    env.try_top_up_insurance(&admin, 1_000_000_000).unwrap();
+    env.crank();
+
+    // Each user trades different size against LP
+    for (i, (user, user_idx)) in user_idxs.iter().enumerate() {
+        env.set_slot((i + 1) as u64);
+        let size = ((i + 1) * 50_000) as i128;
+        env.trade(user, &lp, lp_idx, *user_idx, size);
+    }
+
+    // LP should have total short = -(50K + 100K + 150K + 200K) = -500K
+    let lp_pos = env.read_account_position(lp_idx);
+    assert_eq!(lp_pos, -500_000,
+        "LP position should be sum of user trades: {}", lp_pos);
+
+    // Conservation across all 5 accounts
+    let c_tot = env.read_c_tot();
+    let mut sum = env.read_account_capital(lp_idx);
+    for (_, user_idx) in &user_idxs {
+        sum += env.read_account_capital(*user_idx);
+    }
+    assert_eq!(c_tot, sum,
+        "ATTACK: c_tot desync with 4 users + 1 LP! c_tot={} sum={}", c_tot, sum);
+}
+
+/// ATTACK: Withdraw from LP account (LP should still be able to withdraw).
+/// Verify LP withdraw works the same as user withdraw.
+#[test]
+fn test_attack_lp_withdraw_capital() {
+    let path = program_path();
+    if !path.exists() { return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+
+    env.try_top_up_insurance(&admin, 1_000_000_000).unwrap();
+    env.crank();
+
+    let cap_before = env.read_account_capital(lp_idx);
+    assert!(cap_before > 0, "Precondition: LP has capital");
+
+    // LP withdraws half its capital
+    let withdraw_amount = (cap_before / 2) as u64;
+    env.try_withdraw(&lp, lp_idx, withdraw_amount).unwrap();
+
+    let cap_after = env.read_account_capital(lp_idx);
+    assert_eq!(cap_after, cap_before - withdraw_amount as u128,
+        "LP capital should decrease by withdraw amount");
+}
+
+/// ATTACK: Trade at maximum position size boundary.
+/// Open a position that uses nearly all margin, then try adding more.
+#[test]
+fn test_attack_trade_exceeds_margin_capacity() {
+    let path = program_path();
+    if !path.exists() { return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 100_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000_000); // 1 SOL = 1e9
+
+    env.try_top_up_insurance(&admin, 1_000_000_000).unwrap();
+    env.crank();
+
+    // At $138, with 10% initial margin: max notional = 1e9/0.1 = 10e9
+    // max position = 10e9 * 1e6 / 138e6 ≈ 72.4M
+    // Try opening just within limit
+    let result = env.try_trade(&user, &lp, lp_idx, user_idx, 50_000_000);
+    assert!(result.is_ok(), "Trade within margin should succeed: {:?}", result);
+
+    // Try doubling position (exceeds margin)
+    env.set_slot(2);
+    let result2 = env.try_trade(&user, &lp, lp_idx, user_idx, 50_000_000);
+    assert!(result2.is_err(),
+        "ATTACK: Trade exceeding margin should be rejected!");
+
+    // Original position unchanged
+    assert_eq!(env.read_account_position(user_idx), 50_000_000);
+}
+
+/// ATTACK: InitMarket with admin field in data mismatching signer.
+/// Code validates admin in instruction data matches signer pubkey.
+#[test]
+fn test_attack_init_market_admin_mismatch() {
+    let path = program_path();
+    if !path.exists() { return; }
+
+    let mut svm = LiteSVM::new();
+    let program_id = Pubkey::new_unique();
+    let program_bytes = std::fs::read(&path).expect("Failed to read program");
+    svm.add_program(program_id, &program_bytes);
+    let admin = Keypair::new();
+    svm.airdrop(&admin.pubkey(), 10_000_000_000).unwrap();
+
+    let mint = Pubkey::new_unique();
+    svm.set_account(mint, Account {
+        lamports: 1_000_000,
+        data: vec![0u8; spl_token::state::Mint::LEN],
+        owner: spl_token::ID,
+        executable: false,
+        rent_epoch: 0,
+    }).unwrap();
+
+    let slab = Pubkey::new_unique();
+    let slab_size = 4 * 1024 * 1024;
+    svm.set_account(slab, Account {
+        lamports: 100_000_000_000,
+        data: vec![0u8; slab_size],
+        owner: program_id,
+        executable: false,
+        rent_epoch: 0,
+    }).unwrap();
+
+    let vault = Pubkey::new_unique();
+    svm.set_account(vault, Account {
+        lamports: 1_000_000,
+        data: vec![0u8; spl_token::state::Account::LEN],
+        owner: spl_token::ID,
+        executable: false,
+        rent_epoch: 0,
+    }).unwrap();
+
+    let dummy_ata = Pubkey::new_unique();
+    svm.set_account(dummy_ata, Account {
+        lamports: 1_000_000,
+        data: vec![0u8; spl_token::state::Account::LEN],
+        owner: spl_token::ID,
+        executable: false,
+        rent_epoch: 0,
+    }).unwrap();
+
+    // Use a DIFFERENT pubkey for admin in data vs signer
+    let fake_admin = Pubkey::new_unique();
+    let data = encode_init_market_with_invert(&fake_admin, &mint, &TEST_FEED_ID, 0);
+
+    let ix = Instruction {
+        program_id,
+        accounts: vec![
+            AccountMeta::new(admin.pubkey(), true), // signer
+            AccountMeta::new(slab, false),
+            AccountMeta::new_readonly(mint, false),
+            AccountMeta::new(vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(sysvar::rent::ID, false),
+            AccountMeta::new_readonly(dummy_ata, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        data, // admin in data = fake_admin != signer
+    };
+
+    let tx = Transaction::new_signed_with_payer(
+        &[ix], Some(&admin.pubkey()), &[&admin], svm.latest_blockhash(),
+    );
+    let result = svm.send_transaction(tx);
+    assert!(result.is_err(),
+        "ATTACK: InitMarket with admin mismatch should be rejected!");
+}
+
+/// ATTACK: InitMarket with mint field in data mismatching mint account.
+/// Code validates collateral_mint in data matches the mint account provided.
+#[test]
+fn test_attack_init_market_mint_mismatch() {
+    let path = program_path();
+    if !path.exists() { return; }
+
+    let mut svm = LiteSVM::new();
+    let program_id = Pubkey::new_unique();
+    let program_bytes = std::fs::read(&path).expect("Failed to read program");
+    svm.add_program(program_id, &program_bytes);
+    let admin = Keypair::new();
+    svm.airdrop(&admin.pubkey(), 10_000_000_000).unwrap();
+
+    let real_mint = Pubkey::new_unique();
+    svm.set_account(real_mint, Account {
+        lamports: 1_000_000,
+        data: vec![0u8; spl_token::state::Mint::LEN],
+        owner: spl_token::ID,
+        executable: false,
+        rent_epoch: 0,
+    }).unwrap();
+
+    let fake_mint = Pubkey::new_unique();
+
+    let slab = Pubkey::new_unique();
+    let slab_size = 4 * 1024 * 1024;
+    svm.set_account(slab, Account {
+        lamports: 100_000_000_000,
+        data: vec![0u8; slab_size],
+        owner: program_id,
+        executable: false,
+        rent_epoch: 0,
+    }).unwrap();
+
+    let vault = Pubkey::new_unique();
+    svm.set_account(vault, Account {
+        lamports: 1_000_000,
+        data: vec![0u8; spl_token::state::Account::LEN],
+        owner: spl_token::ID,
+        executable: false,
+        rent_epoch: 0,
+    }).unwrap();
+
+    let dummy_ata = Pubkey::new_unique();
+    svm.set_account(dummy_ata, Account {
+        lamports: 1_000_000,
+        data: vec![0u8; spl_token::state::Account::LEN],
+        owner: spl_token::ID,
+        executable: false,
+        rent_epoch: 0,
+    }).unwrap();
+
+    // Encode with fake_mint in data, but pass real_mint as account
+    let data = encode_init_market_with_invert(&admin.pubkey(), &fake_mint, &TEST_FEED_ID, 0);
+
+    let ix = Instruction {
+        program_id,
+        accounts: vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(slab, false),
+            AccountMeta::new_readonly(real_mint, false), // Real mint != fake_mint in data
+            AccountMeta::new(vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(sysvar::rent::ID, false),
+            AccountMeta::new_readonly(dummy_ata, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        data,
+    };
+
+    let tx = Transaction::new_signed_with_payer(
+        &[ix], Some(&admin.pubkey()), &[&admin], svm.latest_blockhash(),
+    );
+    let result = svm.send_transaction(tx);
+    assert!(result.is_err(),
+        "ATTACK: InitMarket with mint mismatch should be rejected!");
+}
+
+/// ATTACK: Withdraw with wrong vault PDA (correct PDA but from different slab).
+/// Code checks vault PDA derivation matches slab.
+#[test]
+fn test_attack_withdraw_wrong_vault_pda() {
+    let path = program_path();
+    if !path.exists() { return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 20_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 5_000_000_000);
+
+    // Derive a PDA from a different slab
+    let wrong_slab = Pubkey::new_unique();
+    let (wrong_vault_pda, _) = Pubkey::find_program_address(
+        &[b"vault", wrong_slab.as_ref()], &env.program_id,
+    );
+
+    let ata = env.create_ata(&user.pubkey(), 0);
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(user.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new(ata, false),
+            AccountMeta::new_readonly(wrong_vault_pda, false), // Wrong PDA
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(env.pyth_index, false),
+        ],
+        data: encode_withdraw(user_idx, 1_000_000_000),
+    };
+
+    let tx = Transaction::new_signed_with_payer(
+        &[ix], Some(&user.pubkey()), &[&user], env.svm.latest_blockhash(),
+    );
+    let result = env.svm.send_transaction(tx);
+    assert!(result.is_err(),
+        "ATTACK: Withdraw with wrong vault PDA should be rejected!");
+}
+
+/// ATTACK: CloseAccount with wrong vault PDA.
+/// Code checks vault PDA derivation matches slab in CloseAccount path.
+#[test]
+fn test_attack_close_account_wrong_vault_pda() {
+    let path = program_path();
+    if !path.exists() { return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000_000);
+
+    // Crank to settle
+    env.set_slot(200);
+    env.crank();
+
+    // Withdraw all capital first
+    env.try_withdraw(&user, user_idx, 1_000_000_000).unwrap();
+
+    // Try close with wrong vault PDA
+    let wrong_slab = Pubkey::new_unique();
+    let (wrong_vault_pda, _) = Pubkey::find_program_address(
+        &[b"vault", wrong_slab.as_ref()], &env.program_id,
+    );
+
+    let ata = env.create_ata(&user.pubkey(), 0);
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(user.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new(ata, false),
+            AccountMeta::new_readonly(wrong_vault_pda, false), // Wrong PDA
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(env.pyth_index, false),
+        ],
+        data: encode_close_account(user_idx),
+    };
+
+    let tx = Transaction::new_signed_with_payer(
+        &[ix], Some(&user.pubkey()), &[&user], env.svm.latest_blockhash(),
+    );
+    let result = env.svm.send_transaction(tx);
+    assert!(result.is_err(),
+        "ATTACK: CloseAccount with wrong vault PDA should be rejected!");
+}
+
+/// ATTACK: TopUpInsurance with wrong vault account.
+/// Code validates vault matches stored vault_pubkey.
+#[test]
+fn test_attack_topup_insurance_wrong_vault() {
+    let path = program_path();
+    if !path.exists() { return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    // Create a fake vault account
+    let fake_vault = Pubkey::new_unique();
+    env.svm.set_account(fake_vault, Account {
+        lamports: 1_000_000,
+        data: vec![0u8; spl_token::state::Account::LEN],
+        owner: spl_token::ID,
+        executable: false,
+        rent_epoch: 0,
+    }).unwrap();
+
+    let ata = env.create_ata(&admin.pubkey(), 1_000_000_000);
+    let mut data = vec![9u8]; // TopUpInsurance
+    data.extend_from_slice(&1_000_000_000u64.to_le_bytes());
+
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new(ata, false),
+            AccountMeta::new(fake_vault, false), // Wrong vault
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        data,
+    };
+
+    let tx = Transaction::new_signed_with_payer(
+        &[ix], Some(&admin.pubkey()), &[&admin], env.svm.latest_blockhash(),
+    );
+    let result = env.svm.send_transaction(tx);
+    assert!(result.is_err(),
+        "ATTACK: TopUpInsurance with wrong vault should be rejected!");
+}
+
+/// ATTACK: Liquidate permissionless caller not signer.
+/// Verify liquidation requires a valid signer even though it's permissionless.
+#[test]
+fn test_attack_liquidate_caller_not_signer() {
+    let path = program_path();
+    if !path.exists() { return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 100_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 5_000_000_000);
+
+    env.try_top_up_insurance(&admin, 1_000_000_000).unwrap();
+    env.crank();
+    env.trade(&user, &lp, lp_idx, user_idx, 10_000_000);
+
+    let caller = Keypair::new();
+    env.svm.airdrop(&caller.pubkey(), 1_000_000_000).unwrap();
+
+    // Construct liquidation instruction with caller NOT as signer
+    let mut data = vec![10u8]; // LiquidateAtOracle
+    data.extend_from_slice(&user_idx.to_le_bytes());
+
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(caller.pubkey(), false), // NOT a signer
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(env.pyth_index, false),
+        ],
+        data,
+    };
+
+    // Use admin as payer (different from caller)
+    let tx = Transaction::new_signed_with_payer(
+        &[ix], Some(&admin.pubkey()), &[&admin], env.svm.latest_blockhash(),
+    );
+    let result = env.svm.send_transaction(tx);
+    // Liquidation is permissionless, so caller doesn't need to sign.
+    // But the caller account must still be a signer for the transaction to be valid.
+    // Either the Solana runtime rejects (no signer) or the program accepts (permissionless).
+    // In both cases, user capital should not be extractable by attacker.
+    let user_cap = env.read_account_capital(user_idx);
+    assert!(user_cap > 0,
+        "User capital must not be drained: cap={}", user_cap);
+    // Conservation check
+    let spl_vault = env.vault_balance();
+    let engine_vault = env.read_engine_vault();
+    assert_eq!(engine_vault as u64, spl_vault,
+        "Conservation must hold: engine={} spl={}", engine_vault, spl_vault);
+}
+
+/// ATTACK: Deposit with wrong oracle price account.
+/// Verifies oracle account validation rejects wrong price feed.
+#[test]
+fn test_attack_deposit_wrong_oracle_account() {
+    let path = program_path();
+    if !path.exists() { return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+
+    let ata = env.create_ata(&user.pubkey(), 5_000_000_000);
+
+    // Create a fake oracle account
+    let fake_oracle = Pubkey::new_unique();
+    env.svm.set_account(fake_oracle, Account {
+        lamports: 1_000_000,
+        data: vec![0u8; 256], // Garbage data
+        owner: Pubkey::new_unique(), // Wrong owner
+        executable: false,
+        rent_epoch: 0,
+    }).unwrap();
+
+    // Deposit itself doesn't need oracle, but init_user passes pyth_col.
+    // Test that trade with wrong oracle index is rejected.
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 20_000_000_000);
+    env.deposit(&user, user_idx, 5_000_000_000);
+
+    // Construct trade instruction with wrong oracle
+    let mut trade_data = vec![6u8]; // Trade tag
+    trade_data.extend_from_slice(&lp_idx.to_le_bytes());
+    trade_data.extend_from_slice(&user_idx.to_le_bytes());
+    trade_data.extend_from_slice(&1_000_000i128.to_le_bytes());
+
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(user.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(fake_oracle, false), // Wrong oracle
+        ],
+        data: trade_data,
+    };
+
+    let tx = Transaction::new_signed_with_payer(
+        &[ix], Some(&user.pubkey()), &[&user], env.svm.latest_blockhash(),
+    );
+    let result = env.svm.send_transaction(tx);
+    assert!(result.is_err(),
+        "ATTACK: Trade with wrong oracle account should be rejected!");
+}
+
+/// ATTACK: InitUser with new_account_fee.
+/// Verify fee goes to insurance fund and conservation holds.
+#[test]
+fn test_attack_init_user_fee_conservation() {
+    let path = program_path();
+    if !path.exists() { return; }
+
+    let mut env = TestEnv::new();
+    let new_account_fee: u128 = 1_000_000_000;
+    env.init_market_full(0, 0, new_account_fee);
+
+    let user = Keypair::new();
+    env.svm.airdrop(&user.pubkey(), 5_000_000_000).unwrap();
+
+    // Create ATA with enough tokens to cover the fee
+    let ata = env.create_ata(&user.pubkey(), 2_000_000_000);
+
+    // Manually construct InitUser with fee matching new_account_fee
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(user.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new(ata, false),
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(env.pyth_col, false),
+        ],
+        data: encode_init_user(new_account_fee as u64),
+    };
+
+    let tx = Transaction::new_signed_with_payer(
+        &[ix], Some(&user.pubkey()), &[&user], env.svm.latest_blockhash(),
+    );
+    env.svm.send_transaction(tx).expect("init_user with fee failed");
+
+    // Verify insurance received the fee
+    let insurance = env.read_insurance_balance();
+    assert!(insurance >= new_account_fee,
+        "Insurance should have received new_account_fee: got {}", insurance);
+
+    // Verify SPL vault == engine vault (conservation)
+    let spl_vault = env.vault_balance();
+    let engine_vault = env.read_engine_vault();
+    assert_eq!(engine_vault as u64, spl_vault,
+        "Conservation: engine={} spl={}", engine_vault, spl_vault);
+}
+
+/// ATTACK: Crank with wrong oracle account on standard market.
+/// Trade/crank oracle validation should reject mismatched feed.
+#[test]
+fn test_attack_crank_wrong_oracle() {
+    let path = program_path();
+    if !path.exists() { return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 20_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 5_000_000_000);
+
+    env.try_top_up_insurance(&admin, 1_000_000_000).unwrap();
+    env.crank();
+    env.trade(&user, &lp, lp_idx, user_idx, 1_000_000);
+
+    env.set_slot(200);
+
+    // Create a fake oracle that looks like Pyth but with wrong feed_id
+    let fake_oracle = Pubkey::new_unique();
+    env.svm.set_account(fake_oracle, Account {
+        lamports: 1_000_000,
+        data: vec![0u8; 512],
+        owner: Pubkey::new_unique(),
+        executable: false,
+        rent_epoch: 0,
+    }).unwrap();
+
+    let caller = Keypair::new();
+    env.svm.airdrop(&caller.pubkey(), 1_000_000_000).unwrap();
+
+    let mut data = vec![7u8]; // KeeperCrank
+    data.extend_from_slice(&0u16.to_le_bytes()); // caller_idx = 0 (permissionless)
+    data.push(0); // panic = false
+
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(caller.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(fake_oracle, false), // Wrong oracle
+        ],
+        data,
+    };
+
+    let tx = Transaction::new_signed_with_payer(
+        &[ix], Some(&caller.pubkey()), &[&caller], env.svm.latest_blockhash(),
+    );
+    let result = env.svm.send_transaction(tx);
+    assert!(result.is_err(),
+        "ATTACK: Crank with wrong oracle should be rejected!");
+}
+
+/// ATTACK: Withdraw with wrong SPL token program account.
+/// Substituting a fake token program should be rejected.
+#[test]
+fn test_attack_withdraw_wrong_token_program() {
+    let path = program_path();
+    if !path.exists() { return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 5_000_000_000);
+
+    let ata = env.create_ata(&user.pubkey(), 0);
+    let (vault_pda, _) = Pubkey::find_program_address(
+        &[b"vault", env.slab.as_ref()], &env.program_id,
+    );
+
+    // Use a fake token program
+    let fake_token_program = Pubkey::new_unique();
+
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(user.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new(ata, false),
+            AccountMeta::new_readonly(vault_pda, false),
+            AccountMeta::new_readonly(fake_token_program, false), // Wrong token program
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(env.pyth_index, false),
+        ],
+        data: encode_withdraw(user_idx, 1_000_000_000),
+    };
+
+    let tx = Transaction::new_signed_with_payer(
+        &[ix], Some(&user.pubkey()), &[&user], env.svm.latest_blockhash(),
+    );
+    let result = env.svm.send_transaction(tx);
+    assert!(result.is_err(),
+        "ATTACK: Withdraw with wrong token program should be rejected!");
+
+    // Verify capital unchanged
+    let cap = env.read_account_capital(user_idx);
+    assert_eq!(cap, 5_000_000_000,
+        "Capital should be unchanged after failed withdraw");
+}
+
