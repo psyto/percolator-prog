@@ -21,6 +21,7 @@ This README is intentionally **high-level**: it explains the trust model, accoun
 - [Operational runbook](#operational-runbook)
 - [Deployment flow](#deployment-flow)
 - [Security properties and verification](#security-properties-and-verification)
+- [Admin Key Threat Model](#admin-key-threat-model)
 - [Failure modes and recovery](#failure-modes-and-recovery)
 - [Build & test](#build--test)
 
@@ -318,6 +319,88 @@ Kani harnesses are designed to prove program-level coupling invariants, includin
 
 ### Engine properties
 Engine-specific invariants (conservation, warmup, liquidation properties, etc.) live in the `percolator` crate’s verification suite. The program relies on engine correctness but does not restate it.
+
+---
+
+## Admin Key Threat Model
+
+Assume the admin key is compromised or adversarial. This section lists:
+- what that key is intentionally trusted to do (and therefore can abuse),
+- what it is **not** supposed to be able to do.
+
+### What a malicious admin can do (by design / trust boundary)
+
+These are governance powers, not bugs:
+
+1. `UpdateAdmin`
+   - rotate admin to attacker-controlled key or burn admin to zero.
+   - impact: governance capture or permanent governance lockout.
+2. `SetRiskThreshold`
+   - force restrictive gating behavior.
+   - impact: users may be unable to open/increase risk.
+3. `UpdateConfig`
+   - change funding/threshold policy knobs (within validation bounds).
+   - impact: economics can become unfavorable to users.
+4. `SetMaintenanceFee`
+   - increase maintenance fee sharply.
+   - impact: faster capital decay for open accounts.
+5. `SetOracleAuthority` + `SetOraclePriceCap`
+   - choose who can push authority price, and adjust cap behavior.
+   - impact: price input control/censorship surface.
+6. `ResolveMarket`
+   - transition market to resolved mode using stored authority price.
+   - impact: trading/deposits/new accounts are halted; market enters wind-down.
+7. `WithdrawInsurance` (post-resolution, after positions are closed)
+   - withdraw insurance buffer to admin ATA.
+   - impact: no insurance backstop remains.
+8. `AdminForceCloseAccount` (post-resolution only)
+   - force-close abandoned accounts.
+   - impact: users are forcibly settled/closed by admin action.
+9. `KeeperCrank` with `allow_panic != 0`
+   - admin-only panic crank path.
+   - impact: emergency settlement behavior can be triggered.
+10. `CloseSlab` (when market is fully empty)
+    - decommission market account and recover slab lamports.
+    - impact: market is permanently closed.
+
+### What a malicious admin should NOT be able to do
+
+These are intended hard boundaries enforced in code and test suites:
+
+1. Cannot run admin ops without matching signer.
+   - non-admin attempts fail (`EngineUnauthorized`).
+   - covered by tests like `test_attack_admin_op_as_user`, `test_attack_resolve_market_non_admin`, `test_attack_withdraw_insurance_non_admin`.
+2. Cannot use old admin key after rotation.
+   - covered by `test_attack_old_admin_blocked_after_transfer`.
+3. Cannot perform admin ops after admin is burned to `[0;32]`.
+   - covered by `test_attack_burned_admin_cannot_act`, `test_attack_update_admin_to_zero_locks_out`.
+4. Cannot push authority oracle prices unless signer == `oracle_authority`.
+   - covered by `test_attack_oracle_authority_wrong_signer`.
+5. Cannot resolve without an authority price, or resolve twice.
+   - covered by `test_attack_resolve_market_without_oracle_price` and double-resolution tests.
+6. Cannot withdraw insurance before resolution or while any account still has open position.
+   - covered by `test_attack_withdraw_insurance_before_resolution`, `test_attack_withdraw_insurance_with_open_positions`.
+7. Cannot mutate risk/oracle/fee config after resolution.
+   - covered by `test_attack_set_oracle_authority_after_resolution_rejected`,
+     `test_attack_set_oracle_price_cap_after_resolution_rejected`,
+     `test_attack_set_maintenance_fee_after_resolution_rejected`,
+     `test_attack_set_risk_threshold_after_resolution_rejected`.
+8. Cannot force-close arbitrary active positions.
+   - `AdminForceCloseAccount` requires resolved mode and zero position.
+   - covered by `test_admin_force_close_account_requires_resolved` and `test_admin_force_close_account_requires_zero_position`.
+9. Cannot redirect user close payouts to arbitrary token accounts in owner-gated paths.
+   - user paths (`WithdrawCollateral`, `CloseAccount`) require owner signer and owner ATA checks.
+   - `AdminForceCloseAccount` verifies destination ATA owner matches stored account owner.
+10. Cannot close slab while funds/state remain (default build).
+    - requires zero vault, zero insurance, zero used accounts, zero dust.
+    - covered by tests like `test_attack_close_slab_with_insurance_remaining`,
+      `test_attack_close_slab_with_vault_tokens`,
+      `test_attack_close_slab_blocked_by_dormant_account`.
+
+### Critical caveat
+
+If compiled with feature `unsafe_close`, `CloseSlab` intentionally skips safety checks to reduce CU.
+Do not enable `unsafe_close` in production builds.
 
 ---
 
