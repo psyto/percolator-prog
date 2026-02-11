@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Verify unsafe_close is NOT in default features
+        run: |
+          # Ensure unsafe_close cannot be accidentally shipped in production
+          if cargo metadata --format-version 1 --no-deps \
+            | python3 -c "
+          import sys, json
+          meta = json.load(sys.stdin)
+          for pkg in meta['packages']:
+              if pkg['name'] == 'percolator-prog':
+                  defaults = pkg['features'].get('default', [])
+                  if 'unsafe_close' in defaults:
+                      print('FATAL: unsafe_close is in default features!')
+                      sys.exit(1)
+                  print('OK: unsafe_close is not in default features')
+                  sys.exit(0)
+          print('FATAL: percolator-prog package not found')
+          sys.exit(1)
+          "; then
+            echo "Feature gate check passed"
+          else
+            echo "Feature gate check FAILED"
+            exit 1
+          fi
+
+      - name: Build (production, no unsafe_close)
+        run: cargo build --release
+
+      - name: Build with test feature
+        run: cargo build --features test
+
+      - name: Run tests
+        run: cargo test --features test

@@ -3970,6 +3970,30 @@ pub mod processor {
                 if thresh_min > thresh_max {
                     return Err(PercolatorError::InvalidConfigParam.into());
                 }
+                // Finding S: bound funding_k_bps to prevent extreme funding rate multipliers
+                if funding_k_bps > 10_000 {
+                    return Err(PercolatorError::InvalidConfigParam.into());
+                }
+                // Bound funding_max_premium_bps (cap at 100% = 10000 bps)
+                if funding_max_premium_bps > 10_000 || funding_max_premium_bps < 0 {
+                    return Err(PercolatorError::InvalidConfigParam.into());
+                }
+                // Bound funding_max_bps_per_slot (cap at 100 bps per slot)
+                if funding_max_bps_per_slot > 100 || funding_max_bps_per_slot < 0 {
+                    return Err(PercolatorError::InvalidConfigParam.into());
+                }
+                // Bound thresh_step_bps
+                if thresh_step_bps > 10_000 {
+                    return Err(PercolatorError::InvalidConfigParam.into());
+                }
+                // Bound thresh_risk_bps
+                if thresh_risk_bps > 10_000 {
+                    return Err(PercolatorError::InvalidConfigParam.into());
+                }
+                // Require thresh_update_interval_slots > 0
+                if thresh_update_interval_slots == 0 {
+                    return Err(PercolatorError::InvalidConfigParam.into());
+                }
 
                 // Read existing config and update
                 let mut config = state::read_config(&data);
@@ -4113,6 +4137,13 @@ pub mod processor {
 
                 let header = state::read_header(&data);
                 require_admin(header.admin, a_admin.key)?;
+
+                // Finding F: cap the cap to prevent admin from effectively disabling it
+                // 500_000 e2bps = 50% max price change per update
+                const MAX_ORACLE_PRICE_CAP_E2BPS: u64 = 500_000;
+                if max_change_e2bps > MAX_ORACLE_PRICE_CAP_E2BPS {
+                    return Err(PercolatorError::InvalidConfigParam.into());
+                }
 
                 let mut config = state::read_config(&data);
                 config.oracle_price_cap_e2bps = max_change_e2bps;
