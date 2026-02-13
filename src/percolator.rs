@@ -923,14 +923,14 @@ pub mod matcher_abi {
         if ctx.len() < 64 {
             return Err(ProgramError::InvalidAccountData);
         }
-        let abi_version = u32::from_le_bytes(ctx[0..4].try_into().unwrap());
-        let flags = u32::from_le_bytes(ctx[4..8].try_into().unwrap());
-        let exec_price_e6 = u64::from_le_bytes(ctx[8..16].try_into().unwrap());
-        let exec_size = i128::from_le_bytes(ctx[16..32].try_into().unwrap());
-        let req_id = u64::from_le_bytes(ctx[32..40].try_into().unwrap());
-        let lp_account_id = u64::from_le_bytes(ctx[40..48].try_into().unwrap());
-        let oracle_price_e6 = u64::from_le_bytes(ctx[48..56].try_into().unwrap());
-        let reserved = u64::from_le_bytes(ctx[56..64].try_into().unwrap());
+        let abi_version = u32::from_le_bytes(ctx[0..4].try_into().map_err(|_| ProgramError::InvalidAccountData)?);
+        let flags = u32::from_le_bytes(ctx[4..8].try_into().map_err(|_| ProgramError::InvalidAccountData)?);
+        let exec_price_e6 = u64::from_le_bytes(ctx[8..16].try_into().map_err(|_| ProgramError::InvalidAccountData)?);
+        let exec_size = i128::from_le_bytes(ctx[16..32].try_into().map_err(|_| ProgramError::InvalidAccountData)?);
+        let req_id = u64::from_le_bytes(ctx[32..40].try_into().map_err(|_| ProgramError::InvalidAccountData)?);
+        let lp_account_id = u64::from_le_bytes(ctx[40..48].try_into().map_err(|_| ProgramError::InvalidAccountData)?);
+        let oracle_price_e6 = u64::from_le_bytes(ctx[48..56].try_into().map_err(|_| ProgramError::InvalidAccountData)?);
+        let reserved = u64::from_le_bytes(ctx[56..64].try_into().map_err(|_| ProgramError::InvalidAccountData)?);
 
         Ok(MatcherReturn {
             abi_version,
@@ -1384,7 +1384,7 @@ pub mod ix {
         }
         let (bytes, rest) = input.split_at(2);
         *input = rest;
-        Ok(u16::from_le_bytes(bytes.try_into().unwrap()))
+        Ok(u16::from_le_bytes(bytes.try_into().map_err(|_| ProgramError::InvalidInstructionData)?))
     }
 
     fn read_u32(input: &mut &[u8]) -> Result<u32, ProgramError> {
@@ -1393,7 +1393,7 @@ pub mod ix {
         }
         let (bytes, rest) = input.split_at(4);
         *input = rest;
-        Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
+        Ok(u32::from_le_bytes(bytes.try_into().map_err(|_| ProgramError::InvalidInstructionData)?))
     }
 
     fn read_u64(input: &mut &[u8]) -> Result<u64, ProgramError> {
@@ -1402,7 +1402,7 @@ pub mod ix {
         }
         let (bytes, rest) = input.split_at(8);
         *input = rest;
-        Ok(u64::from_le_bytes(bytes.try_into().unwrap()))
+        Ok(u64::from_le_bytes(bytes.try_into().map_err(|_| ProgramError::InvalidInstructionData)?))
     }
 
     fn read_i64(input: &mut &[u8]) -> Result<i64, ProgramError> {
@@ -1411,7 +1411,7 @@ pub mod ix {
         }
         let (bytes, rest) = input.split_at(8);
         *input = rest;
-        Ok(i64::from_le_bytes(bytes.try_into().unwrap()))
+        Ok(i64::from_le_bytes(bytes.try_into().map_err(|_| ProgramError::InvalidInstructionData)?))
     }
 
     fn read_i128(input: &mut &[u8]) -> Result<i128, ProgramError> {
@@ -1420,7 +1420,7 @@ pub mod ix {
         }
         let (bytes, rest) = input.split_at(16);
         *input = rest;
-        Ok(i128::from_le_bytes(bytes.try_into().unwrap()))
+        Ok(i128::from_le_bytes(bytes.try_into().map_err(|_| ProgramError::InvalidInstructionData)?))
     }
 
     fn read_u128(input: &mut &[u8]) -> Result<u128, ProgramError> {
@@ -1429,7 +1429,7 @@ pub mod ix {
         }
         let (bytes, rest) = input.split_at(16);
         *input = rest;
-        Ok(u128::from_le_bytes(bytes.try_into().unwrap()))
+        Ok(u128::from_le_bytes(bytes.try_into().map_err(|_| ProgramError::InvalidInstructionData)?))
     }
 
     fn read_pubkey(input: &mut &[u8]) -> Result<Pubkey, ProgramError> {
@@ -1438,7 +1438,7 @@ pub mod ix {
         }
         let (bytes, rest) = input.split_at(32);
         *input = rest;
-        Ok(Pubkey::new_from_array(bytes.try_into().unwrap()))
+        Ok(Pubkey::new_from_array(bytes.try_into().map_err(|_| ProgramError::InvalidInstructionData)?))
     }
 
     fn read_bytes32(input: &mut &[u8]) -> Result<[u8; 32], ProgramError> {
@@ -1447,7 +1447,7 @@ pub mod ix {
         }
         let (bytes, rest) = input.split_at(32);
         *input = rest;
-        Ok(bytes.try_into().unwrap())
+        Ok(bytes.try_into().map_err(|_| ProgramError::InvalidInstructionData)?)
     }
 
     fn read_risk_params(input: &mut &[u8]) -> Result<RiskParams, ProgramError> {
@@ -1639,8 +1639,10 @@ pub mod state {
 
     /// Read the request nonce from the reserved field in slab header.
     /// The nonce is stored at RESERVED_OFF..RESERVED_OFF+8 as little-endian u64.
-    pub fn read_req_nonce(data: &[u8]) -> u64 {
-        u64::from_le_bytes(data[RESERVED_OFF..RESERVED_OFF + 8].try_into().unwrap())
+    pub fn read_req_nonce(data: &[u8]) -> Result<u64, ProgramError> {
+        let bytes = data.get(RESERVED_OFF..RESERVED_OFF + 8)
+            .ok_or(ProgramError::InvalidAccountData)?;
+        Ok(u64::from_le_bytes(bytes.try_into().map_err(|_| ProgramError::InvalidAccountData)?))
     }
 
     /// Write the request nonce to the reserved field in slab header.
@@ -1653,12 +1655,10 @@ pub mod state {
     }
 
     /// Read the last threshold update slot from _reserved[8..16].
-    pub fn read_last_thr_update_slot(data: &[u8]) -> u64 {
-        u64::from_le_bytes(
-            data[RESERVED_OFF + 8..RESERVED_OFF + 16]
-                .try_into()
-                .unwrap(),
-        )
+    pub fn read_last_thr_update_slot(data: &[u8]) -> Result<u64, ProgramError> {
+        let bytes = data.get(RESERVED_OFF + 8..RESERVED_OFF + 16)
+            .ok_or(ProgramError::InvalidAccountData)?;
+        Ok(u64::from_le_bytes(bytes.try_into().map_err(|_| ProgramError::InvalidAccountData)?))
     }
 
     /// Write the last threshold update slot to _reserved[8..16].
@@ -1667,12 +1667,10 @@ pub mod state {
     }
 
     /// Read accumulated dust (base token remainder) from _reserved[16..24].
-    pub fn read_dust_base(data: &[u8]) -> u64 {
-        u64::from_le_bytes(
-            data[RESERVED_OFF + 16..RESERVED_OFF + 24]
-                .try_into()
-                .unwrap(),
-        )
+    pub fn read_dust_base(data: &[u8]) -> Result<u64, ProgramError> {
+        let bytes = data.get(RESERVED_OFF + 16..RESERVED_OFF + 24)
+            .ok_or(ProgramError::InvalidAccountData)?;
+        Ok(u64::from_le_bytes(bytes.try_into().map_err(|_| ProgramError::InvalidAccountData)?))
     }
 
     /// Write accumulated dust (base token remainder) to _reserved[16..24].
@@ -1801,7 +1799,7 @@ pub mod oracle {
     // Chainlink OCR2 State/Aggregator account layout offsets (devnet format)
     // This is the simpler account format used on Solana devnet
     // Note: Different from the Transmissions ring buffer format in older docs
-    const CL_MIN_LEN: usize = 224; // Minimum required length
+    const CL_MIN_LEN: usize = 232; // Minimum required length (covers CL_OFF_ANSWER + 16)
     const CL_OFF_DECIMALS: usize = 138; // u8 - number of decimals
                                         // Skip unused: latest_round_id (143), live_length (148), live_cursor (152)
                                         // The actual price data is stored directly at tail:
@@ -1843,19 +1841,19 @@ pub mod oracle {
         }
 
         // Validate feed_id matches expected
-        let feed_id: [u8; 32] = data[OFF_FEED_ID..OFF_FEED_ID + 32].try_into().unwrap();
+        let feed_id: [u8; 32] = data[OFF_FEED_ID..OFF_FEED_ID + 32].try_into().map_err(|_| ProgramError::InvalidAccountData)?;
         if &feed_id != expected_feed_id {
             return Err(PercolatorError::InvalidOracleKey.into());
         }
 
         // Read price fields
-        let price = i64::from_le_bytes(data[OFF_PRICE..OFF_PRICE + 8].try_into().unwrap());
-        let conf = u64::from_le_bytes(data[OFF_CONF..OFF_CONF + 8].try_into().unwrap());
-        let expo = i32::from_le_bytes(data[OFF_EXPO..OFF_EXPO + 4].try_into().unwrap());
+        let price = i64::from_le_bytes(data[OFF_PRICE..OFF_PRICE + 8].try_into().map_err(|_| ProgramError::InvalidAccountData)?);
+        let conf = u64::from_le_bytes(data[OFF_CONF..OFF_CONF + 8].try_into().map_err(|_| ProgramError::InvalidAccountData)?);
+        let expo = i32::from_le_bytes(data[OFF_EXPO..OFF_EXPO + 4].try_into().map_err(|_| ProgramError::InvalidAccountData)?);
         let publish_time = i64::from_le_bytes(
             data[OFF_PUBLISH_TIME..OFF_PUBLISH_TIME + 8]
                 .try_into()
-                .unwrap(),
+                .map_err(|_| ProgramError::InvalidAccountData)?,
         );
 
         if price <= 0 {
@@ -1954,11 +1952,11 @@ pub mod oracle {
         let timestamp = u64::from_le_bytes(
             data[CL_OFF_TIMESTAMP..CL_OFF_TIMESTAMP + 8]
                 .try_into()
-                .unwrap(),
+                .map_err(|_| ProgramError::InvalidAccountData)?,
         );
         // Read answer as i128 (16 bytes), but only bottom 8 bytes are typically used
         let answer =
-            i128::from_le_bytes(data[CL_OFF_ANSWER..CL_OFF_ANSWER + 16].try_into().unwrap());
+            i128::from_le_bytes(data[CL_OFF_ANSWER..CL_OFF_ANSWER + 16].try_into().map_err(|_| ProgramError::InvalidAccountData)?);
 
         if answer <= 0 {
             return Err(PercolatorError::OracleInvalid.into());
@@ -2770,7 +2768,7 @@ pub mod processor {
                 let (units, dust) = crate::units::base_to_units(fee_payment, config.unit_scale);
 
                 // Accumulate dust
-                let old_dust = state::read_dust_base(&data);
+                let old_dust = state::read_dust_base(&data)?;
                 state::write_dust_base(&mut data, old_dust.saturating_add(dust));
 
                 let engine = zc::engine_mut(&mut data)?;
@@ -2823,7 +2821,7 @@ pub mod processor {
                 let (units, dust) = crate::units::base_to_units(fee_payment, config.unit_scale);
 
                 // Accumulate dust
-                let old_dust = state::read_dust_base(&data);
+                let old_dust = state::read_dust_base(&data)?;
                 state::write_dust_base(&mut data, old_dust.saturating_add(dust));
 
                 let engine = zc::engine_mut(&mut data)?;
@@ -2881,7 +2879,7 @@ pub mod processor {
                 let (units, dust) = crate::units::base_to_units(amount, config.unit_scale);
 
                 // Accumulate dust
-                let old_dust = state::read_dust_base(&data);
+                let old_dust = state::read_dust_base(&data)?;
                 state::write_dust_base(&mut data, old_dust.saturating_add(dust));
 
                 let engine = zc::engine_mut(&mut data)?;
@@ -3089,7 +3087,7 @@ pub mod processor {
                 let mut config = state::read_config(&data);
                 let header = state::read_header(&data);
                 // Read last threshold update slot BEFORE mutable engine borrow
-                let last_thr_slot = state::read_last_thr_update_slot(&data);
+                let last_thr_slot = state::read_last_thr_update_slot(&data)?;
 
                 // SECURITY (C4): allow_panic triggers global settlement - admin only
                 // This prevents griefing attacks where anyone triggers panic at worst moment
@@ -3101,7 +3099,7 @@ pub mod processor {
                 }
 
                 // Read dust before borrowing engine (for dust sweep later)
-                let dust_before = state::read_dust_base(&data);
+                let dust_before = state::read_dust_base(&data)?;
                 let unit_scale = config.unit_scale;
 
                 let clock = Clock::from_account_info(a_clock)?;
@@ -3452,7 +3450,7 @@ pub mod processor {
 
                     // Phase 3: Monotonic nonce for req_id (prevents replay attacks)
                     // Nonce advancement via verify helper (Kani-provable)
-                    let nonce = state::read_req_nonce(&*data);
+                    let nonce = state::read_req_nonce(&*data)?;
                     let req_id = crate::verify::nonce_on_success(nonce);
 
                     let engine = zc::engine_ref(&*data)?;
@@ -3825,7 +3823,7 @@ pub mod processor {
                 let (units, dust) = crate::units::base_to_units(amount, config.unit_scale);
 
                 // Accumulate dust
-                let old_dust = state::read_dust_base(&data);
+                let old_dust = state::read_dust_base(&data)?;
                 state::write_dust_base(&mut data, old_dust.saturating_add(dust));
 
                 let engine = zc::engine_mut(&mut data)?;
@@ -3905,7 +3903,7 @@ pub mod processor {
                     }
 
                     // Bug #3 fix: Check dust_base to prevent closing with unaccounted funds
-                    let dust_base = state::read_dust_base(&data);
+                    let dust_base = state::read_dust_base(&data)?;
                     if dust_base != 0 {
                         return Err(PercolatorError::EngineInsufficientBalance.into());
                     }
